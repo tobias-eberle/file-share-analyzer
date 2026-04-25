@@ -130,6 +130,77 @@ def test_excludes_filter_files(tmp_path: Path):
     assert names == {"keep.txt"}
 
 
+def test_walker_handles_unreliable_inodes(tmp_path: Path, monkeypatch):
+    """Windows / SMB shares often report st_ino=0 for every directory;
+    the walker must not collapse all of them into a single 'symlink-loop'.
+    """
+    import os as _os
+
+    from share_analyzer.crawl.walker import FileEntry, LocalScandirWalker
+
+    root = tmp_path / "share"
+    for sub in ("a", "b", "c", "d", "e"):
+        d = root / sub
+        d.mkdir(parents=True)
+        (d / f"{sub}.txt").write_text(sub, encoding="utf-8")
+
+    real_scandir = _os.scandir
+
+    class _Wrap:
+        """DirEntry shim that zeroes out st_ino on stat()."""
+        __slots__ = ("_e", "name", "path")
+
+        def __init__(self, e):
+            self._e = e
+            self.name = e.name
+            self.path = e.path
+
+        def is_symlink(self):
+            return self._e.is_symlink()
+
+        def is_dir(self, *, follow_symlinks=True):
+            return self._e.is_dir(follow_symlinks=follow_symlinks)
+
+        def is_file(self, *, follow_symlinks=True):
+            return self._e.is_file(follow_symlinks=follow_symlinks)
+
+        def stat(self, *, follow_symlinks=True):
+            s = self._e.stat(follow_symlinks=follow_symlinks)
+            return _os.stat_result((
+                s.st_mode, 0, s.st_dev, s.st_nlink, s.st_uid, s.st_gid,
+                s.st_size, s.st_atime, s.st_mtime, s.st_ctime,
+            ))
+
+    class _Ctx:
+        def __init__(self, real_iter):
+            self._items = [_Wrap(e) for e in real_iter]
+            real_iter.close()
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def __iter__(self):
+            return iter(self._items)
+
+        def close(self):
+            pass
+
+    def fake_scandir(path):
+        return _Ctx(real_scandir(path))
+
+    monkeypatch.setattr(_os, "scandir", fake_scandir)
+
+    items = list(LocalScandirWalker(root).walk())
+    files = [i for i in items if isinstance(i, FileEntry)]
+    loops = [i for i in items if isinstance(i, WalkError)
+             and i.reason == "symlink-loop"]
+    assert len(files) == 5
+    assert loops == []
+
+
 def test_hash_cap_skips_large_files(tmp_path: Path):
     root = tmp_path / "share"
     root.mkdir()

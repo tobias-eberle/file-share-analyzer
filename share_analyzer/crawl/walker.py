@@ -111,16 +111,25 @@ class LocalScandirWalker:
                         continue
 
                     if is_dir:
-                        try:
-                            st = entry.stat(follow_symlinks=self.follow_symlinks)
-                            key = (st.st_dev, st.st_ino)
-                        except OSError as e:
-                            yield WalkError(path=full, reason=f"stat: {e}")
-                            continue
-                        if key in visited:
-                            yield WalkError(path=full, reason="symlink-loop")
-                            continue
-                        visited.add(key)
+                        # Symlink loops are only possible when actually
+                        # following symlinks. With follow_symlinks=False
+                        # the loop guard offers no protection — and on
+                        # Windows / SMB shares `st_ino` is frequently 0
+                        # (the file-id API isn't fully supported on remote
+                        # filesystems), which would falsely collapse every
+                        # directory into a single "symlink-loop" error.
+                        if self.follow_symlinks:
+                            try:
+                                st = entry.stat(follow_symlinks=True)
+                            except OSError as e:
+                                yield WalkError(path=full, reason=f"stat: {e}")
+                                continue
+                            if st.st_ino:
+                                key = (st.st_dev, st.st_ino)
+                                if key in visited:
+                                    yield WalkError(path=full, reason="symlink-loop")
+                                    continue
+                                visited.add(key)
                         stack.append((full, depth + 1))
                     elif is_file:
                         emitted = self._emit_file(full, current, depth + 1, entry)
