@@ -1,0 +1,33 @@
+[tool.poetry]
+name = "share-analyzer"
+version = "0.1.0"
+description = "Read-only crawler and analyzer for enterprise network shares (RAG-prep)."
+authors = ["Tobias Eberle"]
+readme = "README.md"
+license = "Proprietary"
+packages = [{ include = "share_analyzer" }]
+include = ["share_analyzer/reports/templates/*.html.j2"]
+
+[tool.poetry.dependencies]
+python = ">=3.12,<3.14"
+click = "^8.1"
+jinja2 = "^3.1"
+plotly = "^5.20"
+python-magic = { version = "^0.4.27", markers = "platform_system != 'Windows'" }
+python-magic-bin = { version = "^0.4.14", markers = "platform_system == 'Windows'" }
+
+[tool.poetry.group.dev.dependencies]
+pytest = "^8.0"
+pytest-cov = "^4.1"
+pyinstaller = "^6.0"
+
+[tool.poetry.scripts]
+share-analyzer = "share_analyzer.cli:main"
+
+[build-system]
+requires = ["poetry-core>=1.8.0"]
+build-backend = "poetry.core.masonry.api"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"

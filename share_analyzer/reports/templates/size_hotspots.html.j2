@@ -1,0 +1,28 @@
+{% extends "_base.html.j2" %}
+{% block body %}
+  <p>Top {{ limit }} folders by total size at depths 1–4.</p>
+  {% for level, level_rows in levels %}
+    <h2>Depth {{ level }}</h2>
+    <div class="chart">{{ charts[level] | safe }}</div>
+    <table>
+      <thead>
+        <tr>
+          <th>Path</th>
+          <th class="num">Files</th><th class="num">Size</th>
+          <th>Dominant MIME</th><th>Latest mtime</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for r in level_rows %}
+          <tr>
+            <td><code>{{ r.path }}</code></td>
+            <td class="num">{{ '{:,}'.format(r.file_count) }}</td>
+            <td class="num">{{ r.total_size | human_size }}</td>
+            <td>{% if r.dominant_mime_category %}<span class="pill">{{ r.dominant_mime_category }}</span>{% endif %}</td>
+            <td>{{ r.mtime_max or '' }}</td>
+          </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  {% endfor %}
+{% endblock %}

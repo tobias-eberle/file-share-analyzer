@@ -1,0 +1,23 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+build/
+dist/
+*.spec
+
+# Local environment
+.venv/
+venv/
+
+# SQLite scratch dbs
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+*.sqlite.log
+
+# Poetry
+poetry.lock.bak
