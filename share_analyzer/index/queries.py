@@ -55,7 +55,19 @@ def materialize_folders(conn: sqlite3.Connection, run_id: int) -> int:
     """Compute folder aggregates from `files` and write them into `folders`.
 
     Called once at the end of a crawl, then read by every report.
-    Done in Python to keep parent/depth logic portable across separators.
+
+    Three guarantees the reports rely on:
+      1. Every ancestor of a file-bearing folder is in the table, even when
+         that ancestor contains no direct files (so `Projects/` shows up
+         in the topology even if all its files live in subdirectories).
+      2. `total_size` and `file_count` are recursive — a folder's size is
+         the sum of its direct files plus the rolled-up size of every
+         descendant.
+      3. `max_depth_below` is the depth of the deepest descendant relative
+         to the folder itself.
+
+    Dominant MIME stays direct-files-only by design: a recursive rollup
+    of categories is more confusing than useful at a glance.
     """
     run = conn.execute(
         "SELECT root_path FROM crawl_runs WHERE id = ?", (run_id,)
@@ -66,19 +78,26 @@ def materialize_folders(conn: sqlite3.Connection, run_id: int) -> int:
 
     conn.execute("DELETE FROM folders WHERE run_id = ?", (run_id,))
 
-    aggregates = conn.execute(
+    direct: dict[str, dict] = {}
+    for r in conn.execute(
         """
         SELECT parent_path AS path,
-               COUNT(*) AS file_count,
-               SUM(size) AS total_size,
-               MIN(mtime) AS mtime_min,
-               MAX(mtime) AS mtime_max
+               COUNT(*)    AS file_count,
+               SUM(size)   AS total_size,
+               MIN(mtime)  AS mtime_min,
+               MAX(mtime)  AS mtime_max
         FROM files
         WHERE run_id = ?
         GROUP BY parent_path
         """,
         (run_id,),
-    ).fetchall()
+    ):
+        direct[r["path"]] = {
+            "file_count": r["file_count"],
+            "total_size": r["total_size"] or 0,
+            "mtime_min": r["mtime_min"],
+            "mtime_max": r["mtime_max"],
+        }
 
     dominant: dict[str, str] = {}
     for r in conn.execute(
@@ -93,36 +112,66 @@ def materialize_folders(conn: sqlite3.Connection, run_id: int) -> int:
     ):
         dominant.setdefault(r["parent_path"], r["mime_category"])
 
-    rows: list[tuple] = []
-    for r in aggregates:
-        path = r["path"]
-        parent = _folder_parent(path, root)
-        depth = _folder_depth(path, root)
-        rows.append((
-            run_id, path, parent, depth,
-            r["file_count"], r["total_size"] or 0,
-            0,  # max_depth_below — filled below
-            r["mtime_min"], r["mtime_max"],
-            dominant.get(path),
-        ))
+    folders: dict[str, dict] = {}
 
-    folder_paths = {row[1] for row in rows}
-    max_depth_below: dict[str, int] = {p: 0 for p in folder_paths}
-    for path in folder_paths:
-        cur = path
-        while True:
-            parent = _folder_parent(cur, root)
-            if parent is None or parent not in max_depth_below:
+    def _ensure(path: str) -> None:
+        if path in folders:
+            return
+        d = direct.get(path)
+        folders[path] = {
+            "file_count":      d["file_count"]  if d else 0,
+            "total_size":      d["total_size"]  if d else 0,
+            "mtime_min":       d["mtime_min"]   if d else None,
+            "mtime_max":       d["mtime_max"]   if d else None,
+            "max_depth_below": 0,
+        }
+
+    for path in direct:
+        cur: Optional[str] = path
+        while cur is not None:
+            if cur in folders:
                 break
-            d = _folder_depth(path, root) - _folder_depth(parent, root)
-            if d > max_depth_below[parent]:
-                max_depth_below[parent] = d
-            cur = parent
+            _ensure(cur)
+            if cur == root:
+                break
+            cur = _folder_parent(cur, root)
+    _ensure(root)
+
+    def _merge_mtime(parent: dict, child_min: Optional[str], child_max: Optional[str]) -> None:
+        if child_min and (parent["mtime_min"] is None or child_min < parent["mtime_min"]):
+            parent["mtime_min"] = child_min
+        if child_max and (parent["mtime_max"] is None or child_max > parent["mtime_max"]):
+            parent["mtime_max"] = child_max
+
+    by_depth_desc = sorted(
+        folders, key=lambda p: _folder_depth(p, root), reverse=True
+    )
+    for path in by_depth_desc:
+        if path == root:
+            continue
+        parent = _folder_parent(path, root)
+        if parent is None or parent not in folders:
+            continue
+        f = folders[path]
+        p = folders[parent]
+        p["file_count"] += f["file_count"]
+        p["total_size"] += f["total_size"]
+        _merge_mtime(p, f["mtime_min"], f["mtime_max"])
+        depth_diff = _folder_depth(path, root) - _folder_depth(parent, root)
+        candidate = depth_diff + f["max_depth_below"]
+        if candidate > p["max_depth_below"]:
+            p["max_depth_below"] = candidate
 
     final_rows = [
-        (run_id, path, parent, depth, fc, ts,
-         max_depth_below.get(path, 0), mn, mx, dom)
-        for (run_id, path, parent, depth, fc, ts, _, mn, mx, dom) in rows
+        (
+            run_id, path,
+            _folder_parent(path, root),
+            _folder_depth(path, root),
+            f["file_count"], f["total_size"], f["max_depth_below"],
+            f["mtime_min"], f["mtime_max"],
+            dominant.get(path),
+        )
+        for path, f in folders.items()
     ]
     conn.executemany(
         """

@@ -1,9 +1,15 @@
 """Drives the crawl: walker → worker pool → sink, with checkpointing.
 
-Main thread runs the walker and dispatches FileEntry objects to a thread
-pool of fingerprint workers. Completed (entry, fingerprint) pairs go onto
-a single-writer queue consumed by the sink. This keeps memory bounded
-and SQLite writes serialized.
+Threading model:
+- Main thread runs the walker. Files go onto `in_q` for fingerprinting;
+  walker errors go directly onto `out_q` so they reach the sink without
+  racing with the writer thread on `_buf_errors`.
+- Worker threads consume `in_q`, fingerprint, push (entry, fingerprint)
+  onto `out_q`. On a sentinel they forward one to `out_q` and exit.
+- A single writer thread drains `out_q` and is the only thread that
+  ever calls into the sink during the crawl. If it raises, we capture
+  the exception, set the abort event so workers and the walker bail
+  out of `put`, and re-raise on the main thread after join.
 """
 from __future__ import annotations
 
@@ -41,6 +47,18 @@ class CrawlOptions:
 
 
 _SENTINEL: object = object()
+_PUT_TIMEOUT = 0.25  # seconds — short so abort is observed promptly
+
+
+def _put(q: queue.Queue, item: object, abort: threading.Event) -> bool:
+    """Block on `q.put` while remaining responsive to abort."""
+    while not abort.is_set():
+        try:
+            q.put(item, timeout=_PUT_TIMEOUT)
+            return True
+        except queue.Full:
+            continue
+    return False
 
 
 def run_crawl(
@@ -74,23 +92,29 @@ def run_crawl(
 
     file_count = 0
     error_count = 0
+    abort = threading.Event()
+    writer_exc: list[BaseException] = []
 
     def worker() -> None:
         while True:
             item = in_q.get()
-            if item is _SENTINEL:
-                in_q.task_done()
-                out_q.put(_SENTINEL)
-                return
             try:
-                fp = fingerprinter.fingerprint(item)
-            except Exception as e:  # pragma: no cover — defensive
-                fp = Fingerprint(
-                    sha256=None, mime_type=None, mime_category="other",
-                    owner=None, error=f"{type(e).__name__}: {e}",
-                )
-            out_q.put((item, fp))
-            in_q.task_done()
+                if item is _SENTINEL:
+                    if not abort.is_set():
+                        _put(out_q, _SENTINEL, abort)
+                    return
+                if abort.is_set():
+                    continue
+                try:
+                    fp = fingerprinter.fingerprint(item)
+                except Exception as e:  # pragma: no cover — defensive
+                    fp = Fingerprint(
+                        sha256=None, mime_type=None, mime_category="other",
+                        owner=None, error=f"{type(e).__name__}: {e}",
+                    )
+                _put(out_q, (item, fp), abort)
+            finally:
+                in_q.task_done()
 
     threads = [
         threading.Thread(target=worker, name=f"fp-{i}", daemon=True)
@@ -104,48 +128,72 @@ def run_crawl(
         sentinels = 0
         batch: list[tuple[FileEntry, Fingerprint]] = []
         last_path: Optional[str] = None
-        while sentinels < len(threads):
-            item = out_q.get()
-            try:
-                if item is _SENTINEL:
-                    sentinels += 1
-                    continue
-                entry, fp = item
-                batch.append((entry, fp))
-                last_path = entry.path
-                if fp.error:
-                    error_count += 1
-                if len(batch) >= sink.BATCH_SIZE:
-                    file_count += sink.write_files(batch)
-                    batch.clear()
-                    if file_count % options.checkpoint_every < sink.BATCH_SIZE:
-                        sink.checkpoint(last_path, file_count)
-                        if progress:
-                            progress(file_count, error_count, 0)
-            finally:
-                out_q.task_done()
-        if batch:
-            file_count += sink.write_files(batch)
-        sink.checkpoint(last_path, file_count)
+        try:
+            while sentinels < len(threads):
+                item = out_q.get()
+                try:
+                    if item is _SENTINEL:
+                        sentinels += 1
+                        continue
+                    if isinstance(item, WalkError):
+                        sink.write_errors([item])
+                        error_count += 1
+                        continue
+                    entry, fp = item
+                    batch.append((entry, fp))
+                    last_path = entry.path
+                    if fp.error:
+                        error_count += 1
+                    if len(batch) >= sink.BATCH_SIZE:
+                        file_count += sink.write_files(batch)
+                        batch.clear()
+                        if file_count % options.checkpoint_every < sink.BATCH_SIZE:
+                            sink.checkpoint(last_path, file_count)
+                            if progress:
+                                progress(file_count, error_count, 0)
+                finally:
+                    out_q.task_done()
+            if batch:
+                file_count += sink.write_files(batch)
+            sink.checkpoint(last_path, file_count)
+        except BaseException as e:  # noqa: BLE001 — capture for re-raise
+            writer_exc.append(e)
+            abort.set()
+            # Drain remaining items so workers don't block on out_q.put.
+            while True:
+                try:
+                    out_q.get_nowait()
+                    out_q.task_done()
+                except queue.Empty:
+                    break
 
     writer_thread = threading.Thread(target=writer, name="sink-writer", daemon=True)
     writer_thread.start()
 
-    walk_errors = 0
     try:
         for item in walker.walk():
+            if abort.is_set():
+                break
             if isinstance(item, WalkError):
-                sink.write_errors([item])
-                walk_errors += 1
-                error_count += 1
-                continue
-            in_q.put(item)
+                if not _put(out_q, item, abort):
+                    break
+            else:
+                if not _put(in_q, item, abort):
+                    break
     finally:
         for _ in threads:
             in_q.put(_SENTINEL)
         for t in threads:
             t.join()
         writer_thread.join()
+
+    if writer_exc:
+        sink.end_run(
+            file_count=file_count, error_count=error_count, status="failed",
+        )
+        sink.close()
+        log.error("crawl-failed", extra={"run_id": run_id})
+        raise writer_exc[0]
 
     log.info("materializing-folders", extra={"run_id": run_id})
     materialize_folders(sink.conn, run_id)  # type: ignore[attr-defined]
