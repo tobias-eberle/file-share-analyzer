@@ -20,13 +20,14 @@ code paths.
 
 ```
 share_analyzer/
-  cli.py                  # Click entry point: scan / report / info
+  cli.py                  # Click entry point: scan / rescan / report / info
   config.py               # share-analyzer.toml loader
   logging.py              # JSON sidecar logger + ProgressPrinter
   crawl/
     walker.py             # Walker protocol + LocalScandirWalker
     fingerprint.py        # Fingerprinter + StreamingFingerprinter
     sink.py               # Sink + SqliteSink (batched, WAL)
+    rescan.py             # RescanContext: prior-run delta classifier
     orchestrator.py       # threading + queues + abort handling
   index/
     schema.py             # versioned migrations, connect()
@@ -79,6 +80,37 @@ If you add a new producer or consumer, route it through `_put` — never
 call `q.put(item)` without the abort guard. Otherwise a sink failure
 will hang the crawl.
 
+## File state and incremental rescan
+
+Every `files` row carries a `state` column:
+
+| state       | meaning                                                      |
+|-------------|--------------------------------------------------------------|
+| `baseline`  | full scan, no prior run                                      |
+| `added`     | path didn't exist in the previous run                        |
+| `modified`  | size or mtime changed since the previous run                 |
+| `unchanged` | (size, mtime) match the previous run; sha256/MIME reused     |
+| `deleted`   | path was in the previous run, isn't in this one — row carries the *prior* run's metadata so reports can show what's gone |
+
+**Every report query must filter `state != 'deleted'`** unless it's
+specifically reporting on churn. `materialize_folders` already does this,
+so anything reading from `folders` is safe; queries that read `files`
+directly need an explicit predicate.
+
+`crawl_runs.previous_run_id` links a rescan to its baseline. Phase 2
+write-back will key its audit log on the same id pair.
+
+`RescanContext` (`crawl/rescan.py`) loads the prior snapshot into an
+in-memory dict (~150 B per file, ~150 MB at 1M files). The orchestrator
+calls `classify(entry)` before queuing; `unchanged` rows skip the
+fingerprint workers entirely and go straight to `out_q`. After the walk,
+`SqliteSink.copy_deleted_from_previous` does a single `INSERT … SELECT`
+to materialise deleted rows from the prior run.
+
+Memory ceiling is the obvious follow-up: a streaming merge against a
+sorted walker would drop it to O(depth), but Phase 2 v1 trades that
+complexity for clarity.
+
 ## materialize_folders
 
 This is the trickiest function in the codebase. It must guarantee:
@@ -119,26 +151,39 @@ to hang (it's actually quadratic in the body length). Always check for a
 narrow, non-spurious substring (e.g. `'src="https://cdn.'`), not a token
 that might legitimately appear inside inlined JS.
 
-## Performance notes (known follow-ups)
+## Performance notes
 
-These came up while building phase 1. They aren't required to ship but
-matter for the 1M-file SLA:
+Done in the v2 hardening pass; kept here so the rationale doesn't get
+lost:
 
-- WAL grows unbounded on long crawls — checkpoint with
-  `PRAGMA wal_checkpoint(TRUNCATE)` periodically.
-- `staleness_buckets` pulls every row into Python; convert to a pure-SQL
-  aggregate (`CASE WHEN mtime >= ?`).
-- `top_duplicates` is N+1 on sample paths; replace with a
-  `ROW_NUMBER() OVER (PARTITION BY sha256)` join.
-- `rag_candidates` deduplicates in Python; same fix applies.
-- Composite indexes `(run_id, parent_path)`, `(run_id, mime_category)`,
-  `(run_id, sha256)` — every query starts with `run_id`.
+- `sink.wal_checkpoint()` issues `PRAGMA wal_checkpoint(TRUNCATE)` every
+  `checkpoint_every` files (and once at end-of-run). The WAL no longer
+  grows unbounded on a 1M-file scan.
+- `staleness_buckets`, `top_duplicates`, `rag_candidates` are all
+  pure-SQL aggregates now. `top_duplicates` collects sample paths via a
+  windowed `GROUP_CONCAT` with a U+001F separator (Unit Separator never
+  appears in a path). `rag_candidates` dedups via
+  `ROW_NUMBER() OVER (PARTITION BY COALESCE(sha256, 'p:'||path))` so
+  files without a hash never collapse against unrelated files.
+- Composite indexes `(run_id, parent_path|mime_category|sha256|state|path)`
+  match every report's leading filter.
+
+Still on the list:
+
+- Owner extraction (`pywin32`) — deliberately deferred per PRD.
+- Streaming merge for rescan against a sorted walker (memory ceiling).
+- True move-detection in rescan — currently a renamed file is recorded
+  as `deleted` + `added` even when its sha256 is unchanged.
 
 ## CLI ergonomics
 
 - `share-analyzer report all --db ... --out ...` runs every report into
   one directory.
 - `--run-id` is optional; the latest run is used by default.
+- `share-analyzer rescan --db ...` defaults `--from-run` to the most
+  recent completed run and reuses its `root_path`. To diff against a
+  specific run, pass `--from-run <id>`. A different root_path is
+  rejected — start a fresh index with `scan` instead.
 - A `share-analyzer.toml` in the working directory or any parent supplies
   defaults for `[scan]`. CLI flags override.
 

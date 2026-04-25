@@ -50,11 +50,21 @@ share-analyzer scan <path> --db <file.db>
                   [--exclude <glob>]... [--checkpoint-every 10000]
                   [--follow-symlinks] [-v]
 
+share-analyzer rescan [<path>] --db <file.db>
+                  [--from-run <id>] [--workers 8] [--hash-cap-mb 100]
+                  [--exclude <glob>]... [--checkpoint-every 10000]
+                  [--follow-symlinks] [-v]
+
 share-analyzer report <name|all> --db <file.db> --out <dir>
                   [--format html|csv|jsonl|all] [--run-id <id>]
 
 share-analyzer info --db <file.db> [--run-id <id>]
 ```
+
+`rescan` re-walks the share, reuses prior SHA-256 + MIME for files
+whose `(size, mtime)` are unchanged, fingerprints only the delta, and
+records added / modified / deleted rows so reports can show churn.
+Defaults to diffing against the most recent completed run.
 
 A `share-analyzer.toml` in the working directory (or any parent) supplies
 persistent defaults; CLI flags override.

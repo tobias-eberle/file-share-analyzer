@@ -13,10 +13,12 @@ from share_analyzer.index.mime import seed_mime_categories
 
 
 class Sink(Protocol):
-    def begin_run(self, root_path: str, *, workers: int, hash_cap_bytes: int) -> int: ...
-    def write_files(self, rows: Iterable[tuple[FileEntry, Fingerprint]]) -> int: ...
+    def begin_run(self, root_path: str, *, workers: int, hash_cap_bytes: int,
+                  previous_run_id: Optional[int] = None) -> int: ...
+    def write_files(self, rows: Iterable[tuple[FileEntry, Fingerprint, str]]) -> int: ...
     def write_errors(self, errors: Iterable[WalkError]) -> int: ...
     def checkpoint(self, last_path: Optional[str], files_processed: int) -> None: ...
+    def wal_checkpoint(self) -> None: ...
     def end_run(self, *, file_count: int, error_count: int, status: str) -> None: ...
     def close(self) -> None: ...
 
@@ -40,13 +42,17 @@ class SqliteSink:
             raise RuntimeError("begin_run has not been called")
         return self._run_id
 
-    def begin_run(self, root_path: str, *, workers: int, hash_cap_bytes: int) -> int:
+    def begin_run(self, root_path: str, *, workers: int, hash_cap_bytes: int,
+                  previous_run_id: Optional[int] = None) -> int:
         cur = self.conn.execute(
             """
-            INSERT INTO crawl_runs (root_path, started_at, status, workers, hash_cap_bytes)
-            VALUES (?, ?, 'running', ?, ?)
+            INSERT INTO crawl_runs (
+                root_path, started_at, status, workers, hash_cap_bytes,
+                previous_run_id
+            ) VALUES (?, ?, 'running', ?, ?, ?)
             """,
-            (root_path, datetime.now(timezone.utc).isoformat(), workers, hash_cap_bytes),
+            (root_path, datetime.now(timezone.utc).isoformat(),
+             workers, hash_cap_bytes, previous_run_id),
         )
         self._run_id = cur.lastrowid
         self.conn.execute(
@@ -58,15 +64,16 @@ class SqliteSink:
         )
         return self._run_id
 
-    def write_files(self, rows: Iterable[tuple[FileEntry, Fingerprint]]) -> int:
+    def write_files(self, rows: Iterable[tuple[FileEntry, Fingerprint, str]]) -> int:
         run_id = self.run_id
         n = 0
-        for entry, fp in rows:
+        for entry, fp, state in rows:
             self._buf_files.append((
                 run_id, entry.path, entry.parent_path, entry.depth,
                 entry.name, entry.extension, entry.size,
                 entry.mtime, entry.atime, entry.ctime,
                 fp.sha256, fp.mime_type, fp.mime_category, fp.owner,
+                state,
             ))
             n += 1
             if fp.error:
@@ -97,8 +104,8 @@ class SqliteSink:
             INSERT INTO files (
                 run_id, path, parent_path, depth,
                 name, extension, size, mtime, atime, ctime,
-                sha256, mime_type, mime_category, owner
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                sha256, mime_type, mime_category, owner, state
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             self._buf_files,
         )
@@ -133,6 +140,10 @@ class SqliteSink:
             ),
         )
 
+    def wal_checkpoint(self) -> None:
+        """Force-truncate the WAL so it can't grow without bound on long runs."""
+        self.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+
     def end_run(self, *, file_count: int, error_count: int, status: str) -> None:
         self._flush_files()
         self._flush_errors()
@@ -147,6 +158,33 @@ class SqliteSink:
                 file_count, error_count, status, self.run_id,
             ),
         )
+
+    def copy_deleted_from_previous(self, previous_run_id: int) -> int:
+        """Insert a 'deleted' row for every file in the previous run that
+        wasn't seen in this run. Atomic single-statement insert.
+        """
+        self._flush_files()
+        cur = self.conn.execute(
+            """
+            INSERT INTO files (
+                run_id, path, parent_path, depth, name, extension, size,
+                mtime, atime, ctime, sha256, mime_type, mime_category,
+                owner, state
+            )
+            SELECT ?, prev.path, prev.parent_path, prev.depth, prev.name,
+                   prev.extension, prev.size, prev.mtime, prev.atime,
+                   prev.ctime, prev.sha256, prev.mime_type, prev.mime_category,
+                   prev.owner, 'deleted'
+            FROM files prev
+            LEFT JOIN files cur
+                   ON cur.path = prev.path AND cur.run_id = ?
+            WHERE prev.run_id = ?
+              AND prev.state != 'deleted'
+              AND cur.id IS NULL
+            """,
+            (self.run_id, self.run_id, previous_run_id),
+        )
+        return cur.rowcount or 0
 
     def close(self) -> None:
         self._flush_files()

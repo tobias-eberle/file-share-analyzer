@@ -87,7 +87,7 @@ def materialize_folders(conn: sqlite3.Connection, run_id: int) -> int:
                MIN(mtime)  AS mtime_min,
                MAX(mtime)  AS mtime_max
         FROM files
-        WHERE run_id = ?
+        WHERE run_id = ? AND state != 'deleted'
         GROUP BY parent_path
         """,
         (run_id,),
@@ -104,7 +104,7 @@ def materialize_folders(conn: sqlite3.Connection, run_id: int) -> int:
         """
         SELECT parent_path, mime_category, SUM(size) AS s
         FROM files
-        WHERE run_id = ? AND mime_category IS NOT NULL
+        WHERE run_id = ? AND state != 'deleted' AND mime_category IS NOT NULL
         GROUP BY parent_path, mime_category
         ORDER BY parent_path, s DESC
         """,
@@ -214,67 +214,97 @@ def size_hotspots(conn: sqlite3.Connection, run_id: int,
     return [dict(r) for r in rows]
 
 
+_STALENESS_ORDER = ("<1y", "1-3y", "3-5y", "5y+")
+
+
 def staleness_buckets(conn: sqlite3.Connection, run_id: int,
                        now: Optional[datetime] = None) -> list[dict]:
+    """Bucket files by mtime age.
+
+    Pure-SQL aggregation — `mtime` is stored as ISO-8601 UTC, which is
+    lexicographically sortable, so the cutoffs become string compares.
+    """
     now = now or datetime.now(timezone.utc)
-    cutoffs = {
-        "<1y":  now - timedelta(days=365),
-        "1-3y": now - timedelta(days=365 * 3),
-        "3-5y": now - timedelta(days=365 * 5),
-    }
-    buckets: list[dict] = []
+    c1 = (now - timedelta(days=365)).isoformat()
+    c3 = (now - timedelta(days=365 * 3)).isoformat()
+    c5 = (now - timedelta(days=365 * 5)).isoformat()
+
     rows = conn.execute(
         """
-        SELECT mtime, size FROM files
-        WHERE run_id = ? AND mtime IS NOT NULL
+        SELECT bucket,
+               SUM(c)  AS file_count,
+               SUM(s)  AS total_size
+        FROM (
+            SELECT
+                CASE
+                    WHEN mtime >= ? THEN '<1y'
+                    WHEN mtime >= ? THEN '1-3y'
+                    WHEN mtime >= ? THEN '3-5y'
+                    ELSE '5y+'
+                END AS bucket,
+                1 AS c,
+                COALESCE(size, 0) AS s
+            FROM files
+            WHERE run_id = ? AND state != 'deleted' AND mtime IS NOT NULL
+        )
+        GROUP BY bucket
         """,
-        (run_id,),
+        (c1, c3, c5, run_id),
     ).fetchall()
+    by_bucket = {r["bucket"]: dict(r) for r in rows}
+    return [
+        {
+            "bucket": k,
+            "file_count": (by_bucket.get(k) or {}).get("file_count", 0) or 0,
+            "total_size": (by_bucket.get(k) or {}).get("total_size", 0) or 0,
+        }
+        for k in _STALENESS_ORDER
+    ]
 
-    counters = {"<1y": [0, 0], "1-3y": [0, 0], "3-5y": [0, 0], "5y+": [0, 0]}
-    for r in rows:
-        try:
-            mt = datetime.fromisoformat(r["mtime"])
-        except (TypeError, ValueError):
-            continue
-        if mt.tzinfo is None:
-            mt = mt.replace(tzinfo=timezone.utc)
-        if mt >= cutoffs["<1y"]:
-            key = "<1y"
-        elif mt >= cutoffs["1-3y"]:
-            key = "1-3y"
-        elif mt >= cutoffs["3-5y"]:
-            key = "3-5y"
-        else:
-            key = "5y+"
-        counters[key][0] += 1
-        counters[key][1] += r["size"] or 0
 
-    for k in ("<1y", "1-3y", "3-5y", "5y+"):
-        c, s = counters[k]
-        buckets.append({"bucket": k, "file_count": c, "total_size": s})
-    return buckets
+# Sample-path separator: ASCII Unit Separator never appears in filesystem paths.
+_SAMPLE_SEP = "\x1f"
 
 
 def top_duplicates(conn: sqlite3.Connection, run_id: int,
-                   limit: int = 100) -> list[dict]:
+                   limit: int = 100, sample_size: int = 5) -> list[dict]:
+    """Top duplicate clusters with sample paths, in a single SQL query."""
     rows = conn.execute(
-        """
-        SELECT sha256, file_count, file_size, wasted_bytes
-        FROM duplicates
-        WHERE run_id = ?
+        f"""
+        WITH ranked AS (
+            SELECT
+                sha256, path, size,
+                ROW_NUMBER() OVER (PARTITION BY sha256 ORDER BY path) AS rn,
+                COUNT(*)    OVER (PARTITION BY sha256)              AS file_count
+            FROM files
+            WHERE run_id = ? AND state != 'deleted' AND sha256 IS NOT NULL
+        ),
+        clusters AS (
+            SELECT
+                sha256,
+                file_count,
+                MAX(size)                  AS file_size,
+                (file_count - 1) * MAX(size) AS wasted_bytes,
+                GROUP_CONCAT(
+                    CASE WHEN rn <= ? THEN path END,
+                    '{_SAMPLE_SEP}'
+                ) AS sample_paths_concat
+            FROM ranked
+            GROUP BY sha256
+            HAVING file_count >= 2
+        )
+        SELECT * FROM clusters
         ORDER BY wasted_bytes DESC
         LIMIT ?
         """,
-        (run_id, limit),
+        (run_id, sample_size, limit),
     ).fetchall()
     out = []
     for r in rows:
-        sample = conn.execute(
-            "SELECT path FROM files WHERE run_id = ? AND sha256 = ? LIMIT 5",
-            (run_id, r["sha256"]),
-        ).fetchall()
-        out.append({**dict(r), "sample_paths": [s["path"] for s in sample]})
+        d = dict(r)
+        concat = d.pop("sample_paths_concat") or ""
+        d["sample_paths"] = [p for p in concat.split(_SAMPLE_SEP) if p]
+        out.append(d)
     return out
 
 
@@ -285,7 +315,7 @@ def category_distribution(conn: sqlite3.Connection, run_id: int) -> list[dict]:
                COUNT(*) AS file_count,
                SUM(size) AS total_size
         FROM files
-        WHERE run_id = ?
+        WHERE run_id = ? AND state != 'deleted'
         GROUP BY category
         ORDER BY total_size DESC
         """,
@@ -302,7 +332,7 @@ def extension_distribution(conn: sqlite3.Connection, run_id: int,
                COUNT(*) AS file_count,
                SUM(size) AS total_size
         FROM files
-        WHERE run_id = ?
+        WHERE run_id = ? AND state != 'deleted'
         GROUP BY extension
         ORDER BY file_count DESC
         LIMIT ?
@@ -318,25 +348,66 @@ def rag_candidates(conn: sqlite3.Connection, run_id: int, *,
                    categories: tuple[str, ...] = ("text-extractable",),
                    include_one_per_dup: bool = True,
                    now: Optional[datetime] = None):
+    """Yield RAG candidate rows.
+
+    Dedup is done in SQL via `ROW_NUMBER() OVER (PARTITION BY sha256)`.
+    Files without a sha256 (oversized) get a synthetic per-path partition
+    so they're never collapsed against unrelated files.
+    """
     now = now or datetime.now(timezone.utc)
     cutoff = (now - timedelta(days=max_age_days)).isoformat()
     placeholders = ",".join("?" for _ in categories)
-    sql = f"""
-        SELECT id, path, parent_path, name, extension, size, mtime, sha256,
-               mime_type, mime_category
+    if include_one_per_dup:
+        sql = f"""
+            WITH filtered AS (
+                SELECT id, path, parent_path, name, extension, size, mtime,
+                       sha256, mime_type, mime_category,
+                       ROW_NUMBER() OVER (
+                           PARTITION BY COALESCE(sha256, 'p:' || path)
+                           ORDER BY mtime DESC, id ASC
+                       ) AS rn
+                FROM files
+                WHERE run_id = ?
+                  AND state != 'deleted'
+                  AND mime_category IN ({placeholders})
+                  AND size BETWEEN ? AND ?
+                  AND (mtime IS NULL OR mtime >= ?)
+            )
+            SELECT id, path, parent_path, name, extension, size, mtime,
+                   sha256, mime_type, mime_category
+            FROM filtered
+            WHERE rn = 1
+            ORDER BY mtime DESC
+        """
+    else:
+        sql = f"""
+            SELECT id, path, parent_path, name, extension, size, mtime,
+                   sha256, mime_type, mime_category
+            FROM files
+            WHERE run_id = ?
+              AND state != 'deleted'
+              AND mime_category IN ({placeholders})
+              AND size BETWEEN ? AND ?
+              AND (mtime IS NULL OR mtime >= ?)
+            ORDER BY mtime DESC
+        """
+    params = [run_id, *categories, min_size, max_size, cutoff]
+    for row in conn.execute(sql, params):
+        yield dict(row)
+
+
+def changed_files_summary(conn: sqlite3.Connection, run_id: int) -> dict[str, int]:
+    """Per-state counts for an incremental run. Returns 0s for missing states."""
+    rows = conn.execute(
+        """
+        SELECT state, COUNT(*) AS n
         FROM files
         WHERE run_id = ?
-          AND mime_category IN ({placeholders})
-          AND size BETWEEN ? AND ?
-          AND (mtime IS NULL OR mtime >= ?)
-        ORDER BY mtime DESC
-    """
-    params = [run_id, *categories, min_size, max_size, cutoff]
-    seen_sha: set[str] = set()
-    for row in conn.execute(sql, params):
-        sha = row["sha256"]
-        if include_one_per_dup and sha:
-            if sha in seen_sha:
-                continue
-            seen_sha.add(sha)
-        yield dict(row)
+        GROUP BY state
+        """,
+        (run_id,),
+    ).fetchall()
+    counts = {"baseline": 0, "added": 0, "modified": 0, "unchanged": 0, "deleted": 0}
+    for r in rows:
+        counts[r["state"]] = r["n"]
+    return counts

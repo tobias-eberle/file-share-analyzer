@@ -9,7 +9,7 @@ import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
 
-CURRENT_VERSION = 1
+CURRENT_VERSION = 2
 
 
 _MIGRATIONS: dict[int, list[str]] = {
@@ -110,6 +110,39 @@ _MIGRATIONS: dict[int, list[str]] = {
                 (COUNT(*) - 1) * MAX(size) AS wasted_bytes
             FROM files
             WHERE sha256 IS NOT NULL
+            GROUP BY run_id, sha256
+            HAVING COUNT(*) >= 2
+        """,
+    ],
+    2: [
+        # File lifecycle column for incremental rescans:
+        #   'baseline'  — full scan (no prior run)
+        #   'added'     — present in this run, absent in previous
+        #   'modified'  — size or mtime changed since previous
+        #   'unchanged' — size + mtime match previous; sha256 reused
+        #   'deleted'   — present in previous, absent in this run
+        #                 (row carries the prior run's metadata)
+        "ALTER TABLE files ADD COLUMN state TEXT NOT NULL DEFAULT 'baseline'",
+        "ALTER TABLE crawl_runs ADD COLUMN previous_run_id INTEGER REFERENCES crawl_runs(id)",
+        # Composite indexes — every query starts with run_id, so the
+        # leading column lets SQLite skip straight to the relevant slice.
+        "CREATE INDEX IF NOT EXISTS idx_files_run_parent  ON files(run_id, parent_path)",
+        "CREATE INDEX IF NOT EXISTS idx_files_run_mime    ON files(run_id, mime_category)",
+        "CREATE INDEX IF NOT EXISTS idx_files_run_sha256  ON files(run_id, sha256)",
+        "CREATE INDEX IF NOT EXISTS idx_files_run_state   ON files(run_id, state)",
+        "CREATE INDEX IF NOT EXISTS idx_files_run_path    ON files(run_id, path)",
+        # Replace the v1 view with one that excludes deleted rows.
+        "DROP VIEW IF EXISTS duplicates",
+        """
+        CREATE VIEW duplicates AS
+            SELECT
+                run_id,
+                sha256,
+                COUNT(*)                   AS file_count,
+                MAX(size)                  AS file_size,
+                (COUNT(*) - 1) * MAX(size) AS wasted_bytes
+            FROM files
+            WHERE sha256 IS NOT NULL AND state != 'deleted'
             GROUP BY run_id, sha256
             HAVING COUNT(*) >= 2
         """,
