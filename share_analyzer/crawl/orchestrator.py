@@ -28,6 +28,7 @@ from typing import Callable, Optional, Sequence
 
 from share_analyzer.crawl.fingerprint import Fingerprint, Fingerprinter, StreamingFingerprinter
 from share_analyzer.crawl.rescan import RescanContext
+from share_analyzer.crawl.retry import DEFAULT_BACKOFF
 from share_analyzer.crawl.sink import Sink, SqliteSink
 from share_analyzer.crawl.walker import FileEntry, LocalScandirWalker, WalkError, Walker
 from share_analyzer.index.queries import materialize_folders
@@ -54,6 +55,7 @@ class CrawlOptions:
     exclude_globs: Sequence[str] = ()
     follow_symlinks: bool = False
     previous_run_id: Optional[int] = None
+    retry_backoff: Sequence[float] = DEFAULT_BACKOFF
 
 
 _SENTINEL: object = object()
@@ -86,8 +88,12 @@ def run_crawl(
         root,
         exclude_globs=options.exclude_globs,
         follow_symlinks=options.follow_symlinks,
+        retry_backoff=options.retry_backoff,
     )
-    fingerprinter = fingerprinter or StreamingFingerprinter(options.hash_cap_bytes)
+    fingerprinter = fingerprinter or StreamingFingerprinter(
+        options.hash_cap_bytes,
+        retry_backoff=options.retry_backoff,
+    )
     sink = sink or SqliteSink(db_path)
 
     rescan_ctx: Optional[RescanContext] = None

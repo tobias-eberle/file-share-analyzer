@@ -21,13 +21,14 @@ code paths.
 ```
 share_analyzer/
   cli.py                  # Click entry point: scan / rescan / report / info
-  config.py               # share-analyzer.toml loader
+  config.py               # share-analyzer.toml loader + DEFAULT_EXCLUDES
   logging.py              # JSON sidecar logger + ProgressPrinter
   crawl/
     walker.py             # Walker protocol + LocalScandirWalker
     fingerprint.py        # Fingerprinter + StreamingFingerprinter
     sink.py               # Sink + SqliteSink (batched, WAL)
     rescan.py             # RescanContext: prior-run delta classifier
+    retry.py              # is_transient + with_retry for SMB I/O
     orchestrator.py       # threading + queues + abort handling
   index/
     schema.py             # versioned migrations, connect()
@@ -79,6 +80,41 @@ The orchestrator is the only place threads run.
 If you add a new producer or consumer, route it through `_put` — never
 call `q.put(item)` without the abort guard. Otherwise a sink failure
 will hang the crawl.
+
+## SMB / Windows quirks
+
+These bit us on real shares; they're worth understanding before changing
+the affected code.
+
+- **`st_ino == 0` on remote filesystems.** Windows often returns 0 for
+  the inode on SMB-mounted directories because the file-id API isn't
+  fully supported. The walker's symlink-loop guard skips the inode check
+  when `st_ino == 0` (and only enables the guard at all when
+  `follow_symlinks=True`, since loops are structurally impossible without
+  symlink traversal). See `walker.py::LocalScandirWalker.walk` and
+  `tests/test_crawler.py::test_walker_does_not_falsely_flag_smb_loop`.
+- **Timestamp resolution varies by protocol.** SMB1 rounds to 100 ns,
+  FAT to 2 s, ext4 to 1 ns. A re-mount under a different protocol can
+  round mtimes differently between two scans of the same unmodified
+  file. `RescanContext` therefore compares mtimes with a 2 s tolerance
+  whenever size is unchanged. See `rescan.py::DEFAULT_MTIME_TOLERANCE_S`.
+- **Transient I/O errors.** Network blips, server reconnects, and brief
+  lock contention all surface as `OSError` with errnos like `ETIMEDOUT`,
+  `ECONNRESET`, or Windows `ERROR_NETNAME_DELETED` (winerror 64). The
+  walker's `os.scandir` and `entry.stat`, plus the fingerprinter's
+  `open()`, retry up to `len(retry_backoff)` times for the errnos in
+  `retry.TRANSIENT_ERRNOS / TRANSIENT_WINERRORS`. **Reads inside an open
+  file are NOT retried** — a mid-stream failure invalidates the partial
+  hash, so we abandon and record the error rather than re-cost the
+  bytes already read. The retry budget is per-call, not global; that
+  means the worst case for a fully-degraded share is `attempts × N`
+  files of pain rather than instant failure. Worth keeping in mind.
+- **Curated default excludes.** `config.py::DEFAULT_EXCLUDES` filters
+  the standard nuisance set (`~$*` Office locks, `Thumbs.db`,
+  `desktop.ini`, `*.tmp`, `$RECYCLE.BIN`, `.DS_Store`, …) on every scan.
+  Disable with `--no-default-excludes` or
+  `[scan].default_excludes = false`. Edit the constant — not the
+  walker — when adding new patterns.
 
 ## File state and incremental rescan
 

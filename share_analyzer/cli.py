@@ -1,15 +1,17 @@
-"""Click-based CLI: scan, report, info."""
+"""Click-based CLI: scan, rescan, report, info."""
 from __future__ import annotations
 
 import sys
 from pathlib import Path
+from typing import Sequence
 
 import click
 
 from share_analyzer import __version__
-from share_analyzer.config import load_config
+from share_analyzer.config import DEFAULT_EXCLUDES, load_config
 from share_analyzer.crawl.orchestrator import CrawlOptions, run_crawl
 from share_analyzer.crawl.rescan import latest_completed_run
+from share_analyzer.crawl.retry import DEFAULT_BACKOFF
 from share_analyzer.index.queries import (
     changed_files_summary, latest_run_id, run_summary,
 )
@@ -18,6 +20,30 @@ from share_analyzer.logging import ProgressPrinter, configure_logging
 from share_analyzer.reports import REPORTS, run_all, run_report
 
 _REPORT_NAMES = sorted(REPORTS.keys())
+
+
+def _resolve_excludes(cfg: dict, cli_excludes: Sequence[str],
+                      no_defaults: bool) -> tuple[str, ...]:
+    """Compose the effective exclude list from defaults + TOML + CLI."""
+    use_defaults = not no_defaults and cfg.get("default_excludes", True)
+    defaults = DEFAULT_EXCLUDES if use_defaults else ()
+    return tuple(defaults) + tuple(cfg.get("exclude", [])) + tuple(cli_excludes)
+
+
+def _resolve_backoff(retry_attempts: int) -> tuple[float, ...]:
+    """Translate --retry-attempts into a backoff sequence.
+
+    `attempts` counts the *retries* after the first try, so 0 disables
+    retries entirely. We take the first N entries from DEFAULT_BACKOFF
+    and pad with the last value when the user asks for more than the
+    default length — keeps the curve sensible without a separate flag.
+    """
+    n = max(0, retry_attempts)
+    if n == 0:
+        return ()
+    if n <= len(DEFAULT_BACKOFF):
+        return DEFAULT_BACKOFF[:n]
+    return DEFAULT_BACKOFF + (DEFAULT_BACKOFF[-1],) * (n - len(DEFAULT_BACKOFF))
 
 
 @click.group(context_settings={"help_option_names": ["-h", "--help"]})
@@ -41,6 +67,13 @@ def main(ctx: click.Context, config: Path | None) -> None:
               help="Skip SHA-256 for files larger than this (in MB).")
 @click.option("--exclude", "exclude_globs", multiple=True,
               help="Glob to exclude (matched against name and full path). Repeatable.")
+@click.option("--no-default-excludes", is_flag=True, default=False,
+              help="Don't apply the curated nuisance-file exclude list "
+                   "(~$*, Thumbs.db, desktop.ini, *.tmp, $RECYCLE.BIN, …).")
+@click.option("--retry-attempts", type=int, default=len(DEFAULT_BACKOFF),
+              show_default=True,
+              help="Retry transient I/O errors this many times "
+                   "(0 = no retries). Backoff is 0.2s, 1s, 5s.")
 @click.option("--checkpoint-every", type=int, default=10_000, show_default=True,
               help="Persist a checkpoint every N files.")
 @click.option("--follow-symlinks", is_flag=True, default=False,
@@ -49,12 +82,13 @@ def main(ctx: click.Context, config: Path | None) -> None:
 @click.pass_context
 def scan(ctx: click.Context, path: Path, db_path: Path,
          workers: int, hash_cap_mb: int, exclude_globs: tuple[str, ...],
+         no_default_excludes: bool, retry_attempts: int,
          checkpoint_every: int, follow_symlinks: bool, verbose: bool) -> None:
     """Crawl PATH and build the SQLite index."""
     cfg = ctx.obj["config"].get("scan", {}) if ctx.obj else {}
     workers = cfg.get("workers", workers)
     hash_cap_mb = cfg.get("hash_cap_mb", hash_cap_mb)
-    exclude_globs = tuple(cfg.get("exclude", [])) + exclude_globs
+    effective_excludes = _resolve_excludes(cfg, exclude_globs, no_default_excludes)
 
     db_path.parent.mkdir(parents=True, exist_ok=True)
     configure_logging(db_path, verbose=verbose)
@@ -69,9 +103,10 @@ def scan(ctx: click.Context, path: Path, db_path: Path,
     options = CrawlOptions(
         workers=workers,
         hash_cap_bytes=hash_cap_mb * 1024 * 1024,
-        exclude_globs=exclude_globs,
+        exclude_globs=effective_excludes,
         checkpoint_every=checkpoint_every,
         follow_symlinks=follow_symlinks,
+        retry_backoff=_resolve_backoff(retry_attempts),
     )
 
     click.echo(f"share-analyzer {__version__}: scanning {path} → {db_path}")
@@ -93,11 +128,16 @@ def scan(ctx: click.Context, path: Path, db_path: Path,
 @click.option("--workers", type=int, default=8, show_default=True)
 @click.option("--hash-cap-mb", type=int, default=100, show_default=True)
 @click.option("--exclude", "exclude_globs", multiple=True)
+@click.option("--no-default-excludes", is_flag=True, default=False)
+@click.option("--retry-attempts", type=int, default=len(DEFAULT_BACKOFF),
+              show_default=True)
 @click.option("--checkpoint-every", type=int, default=10_000, show_default=True)
 @click.option("--follow-symlinks", is_flag=True, default=False)
 @click.option("-v", "--verbose", is_flag=True, default=False)
-def rescan(path: Path | None, db_path: Path, from_run: int | None,
+@click.pass_context
+def rescan(ctx: click.Context, path: Path | None, db_path: Path, from_run: int | None,
            workers: int, hash_cap_mb: int, exclude_globs: tuple[str, ...],
+           no_default_excludes: bool, retry_attempts: int,
            checkpoint_every: int, follow_symlinks: bool, verbose: bool) -> None:
     """Crawl PATH again and record only the delta against a prior run.
 
@@ -141,13 +181,16 @@ def rescan(path: Path | None, db_path: Path, from_run: int | None,
         progress._errors = errors   # noqa: SLF001
         progress.update(force=True)
 
+    cfg = ctx.obj["config"].get("scan", {}) if ctx.obj else {}
+    effective_excludes = _resolve_excludes(cfg, exclude_globs, no_default_excludes)
     options = CrawlOptions(
         workers=workers,
         hash_cap_bytes=hash_cap_mb * 1024 * 1024,
-        exclude_globs=exclude_globs,
+        exclude_globs=effective_excludes,
         checkpoint_every=checkpoint_every,
         follow_symlinks=follow_symlinks,
         previous_run_id=from_run,
+        retry_backoff=_resolve_backoff(retry_attempts),
     )
 
     click.echo(

@@ -47,12 +47,14 @@ per duplicate cluster.
 ```
 share-analyzer scan <path> --db <file.db>
                   [--workers 8] [--hash-cap-mb 100]
-                  [--exclude <glob>]... [--checkpoint-every 10000]
+                  [--exclude <glob>]... [--no-default-excludes]
+                  [--retry-attempts 3] [--checkpoint-every 10000]
                   [--follow-symlinks] [-v]
 
 share-analyzer rescan [<path>] --db <file.db>
                   [--from-run <id>] [--workers 8] [--hash-cap-mb 100]
-                  [--exclude <glob>]... [--checkpoint-every 10000]
+                  [--exclude <glob>]... [--no-default-excludes]
+                  [--retry-attempts 3] [--checkpoint-every 10000]
                   [--follow-symlinks] [-v]
 
 share-analyzer report <name|all> --db <file.db> --out <dir>
@@ -60,6 +62,21 @@ share-analyzer report <name|all> --db <file.db> --out <dir>
 
 share-analyzer info --db <file.db> [--run-id <id>]
 ```
+
+`scan` and `rescan` apply a curated default-exclude list that filters
+the usual Windows nuisance files: Office lock files (`~$*`),
+`Thumbs.db`, `desktop.ini`, `*.tmp`, `$RECYCLE.BIN`, `.DS_Store`, and a
+handful of system files. Disable with `--no-default-excludes` or
+`[scan].default_excludes = false` in `share-analyzer.toml`.
+
+Transient I/O errors (network blips, locked files, Windows
+`ERROR_NETNAME_DELETED`, …) are retried with exponential backoff
+(0.2 s / 1 s / 5 s by default). Tune with `--retry-attempts 0..N`;
+`0` disables retries. Permanent errors (`ENOENT`, `EACCES`, …) are not
+retried.
+
+UNC paths work without `net use`: pass `\\server\share\path` directly
+on Windows.
 
 `rescan` re-walks the share, reuses prior SHA-256 + MIME for files
 whose `(size, mtime)` are unchanged, fingerprints only the delta, and

@@ -5,13 +5,18 @@ the orchestrator or sink.
 """
 from __future__ import annotations
 
+import logging
 import os
 import sys
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from fnmatch import fnmatch
 from pathlib import Path
-from typing import Iterator, Protocol, Sequence
+from typing import Callable, Iterator, Optional, Protocol, Sequence
+
+from share_analyzer.crawl.retry import DEFAULT_BACKOFF, with_retry
+
+log = logging.getLogger("share_analyzer.crawl.walker")
 
 
 @dataclass(slots=True)
@@ -67,15 +72,28 @@ class LocalScandirWalker:
 
     def __init__(self, root: str | Path, *,
                  exclude_globs: Sequence[str] = (),
-                 follow_symlinks: bool = False) -> None:
+                 follow_symlinks: bool = False,
+                 retry_backoff: Sequence[float] = DEFAULT_BACKOFF) -> None:
         self.root = str(Path(root))
         self.exclude_globs = tuple(exclude_globs)
         self.follow_symlinks = follow_symlinks
+        self.retry_backoff = tuple(retry_backoff)
 
     def _excluded(self, name: str, full: str) -> bool:
         if not self.exclude_globs:
             return False
         return any(fnmatch(name, g) or fnmatch(full, g) for g in self.exclude_globs)
+
+    def _retry(self, fn: Callable[[], object], path: str) -> object:
+        def _on_retry(attempt: int, exc: BaseException, sleep_s: float) -> None:
+            log.info("retry", extra={
+                "path": path, "attempt": attempt,
+                "errno": getattr(exc, "errno", None),
+                "winerror": getattr(exc, "winerror", None),
+                "sleep_s": sleep_s,
+                "exc": f"{type(exc).__name__}: {exc}",
+            })
+        return with_retry(fn, backoff=self.retry_backoff, on_retry=_on_retry)
 
     def walk(self) -> Iterator[FileEntry | WalkError]:
         root = self.root
@@ -85,7 +103,7 @@ class LocalScandirWalker:
             current, depth = stack.pop()
             scan_target = _long_path(current)
             try:
-                it = os.scandir(scan_target)
+                it = self._retry(lambda: os.scandir(scan_target), current)
             except (PermissionError, FileNotFoundError, NotADirectoryError, OSError) as e:
                 yield WalkError(path=current, reason=f"{type(e).__name__}: {e}")
                 continue
@@ -120,7 +138,10 @@ class LocalScandirWalker:
                         # directory into a single "symlink-loop" error.
                         if self.follow_symlinks:
                             try:
-                                st = entry.stat(follow_symlinks=True)
+                                st = self._retry(
+                                    lambda: entry.stat(follow_symlinks=True),
+                                    full,
+                                )
                             except OSError as e:
                                 yield WalkError(path=full, reason=f"stat: {e}")
                                 continue
@@ -138,10 +159,9 @@ class LocalScandirWalker:
                     else:
                         yield WalkError(path=full, reason="non-regular file")
 
-    @staticmethod
-    def _emit_file(full: str, parent: str, depth: int, entry) -> FileEntry | WalkError:
+    def _emit_file(self, full: str, parent: str, depth: int, entry) -> FileEntry | WalkError:
         try:
-            st = entry.stat(follow_symlinks=False)
+            st = self._retry(lambda: entry.stat(follow_symlinks=False), full)
         except OSError as e:
             return WalkError(path=full, reason=f"stat: {e}")
         name = entry.name

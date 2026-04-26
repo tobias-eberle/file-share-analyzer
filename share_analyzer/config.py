@@ -8,6 +8,31 @@ from typing import Any
 
 CONFIG_FILENAME = "share-analyzer.toml"
 
+# Glob patterns that match the standard nuisance files real Windows /
+# SMB shares accumulate. Matched against entry name and full path via
+# fnmatch in the walker. Applied unless `--no-default-excludes` is set
+# or `[scan].default_excludes = false` in share-analyzer.toml.
+#
+# Curated to be safe: every entry is either a system-generated artifact
+# (Office lock files, recycle bin, OS metadata) or a temp-file convention
+# that's never a RAG candidate. Listed alphabetically for review.
+DEFAULT_EXCLUDES: tuple[str, ...] = (
+    "$RECYCLE.BIN",
+    ".DS_Store",
+    ".~lock.*#",
+    "Thumbs.db",
+    "Thumbs.db:encryptable",
+    "__MACOSX",
+    "desktop.ini",
+    "ehthumbs.db",
+    "hiberfil.sys",
+    "pagefile.sys",
+    "swapfile.sys",
+    "~$*",
+    "~*.tmp",
+    "*.tmp",
+)
+
 
 def find_config(start: Path) -> Path | None:
     cur = start.resolve()

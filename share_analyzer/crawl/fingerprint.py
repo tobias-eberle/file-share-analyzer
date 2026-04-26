@@ -5,13 +5,17 @@ Streams the file in chunks so memory stays bounded even for 100 MB files.
 from __future__ import annotations
 
 import hashlib
+import logging
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional, Protocol
+from typing import Optional, Protocol, Sequence
 
+from share_analyzer.crawl.retry import DEFAULT_BACKOFF, with_retry
 from share_analyzer.crawl.walker import FileEntry
 from share_analyzer.index.mime import MimeDetector, categorize
+
+log = logging.getLogger("share_analyzer.crawl.fingerprint")
 
 
 @dataclass(slots=True)
@@ -50,16 +54,44 @@ class StreamingFingerprinter:
     HEAD_BYTES = 8192
     HASH_CHUNK = 1024 * 1024  # 1 MiB
 
-    def __init__(self, hash_cap_bytes: int = 100 * 1024 * 1024) -> None:
+    def __init__(self, hash_cap_bytes: int = 100 * 1024 * 1024,
+                 retry_backoff: Sequence[float] = DEFAULT_BACKOFF) -> None:
         self.hash_cap_bytes = hash_cap_bytes
+        self.retry_backoff = tuple(retry_backoff)
         self._mime = MimeDetector()
 
     def fingerprint(self, entry: FileEntry) -> Fingerprint:
         path = _open_path(entry.path)
         head = b""
         sha = None
+
+        def _on_retry(attempt: int, exc: BaseException, sleep_s: float) -> None:
+            log.info("retry-open", extra={
+                "path": entry.path, "attempt": attempt,
+                "errno": getattr(exc, "errno", None),
+                "winerror": getattr(exc, "winerror", None),
+                "sleep_s": sleep_s,
+            })
+
         try:
-            with open(path, "rb") as f:
+            # Only the open() is retried; reads inside the open file aren't
+            # — a mid-stream failure invalidates the partial hash, so we
+            # abandon and record the error rather than restart from byte 0
+            # (which would double-cost the bytes already read).
+            f = with_retry(
+                lambda: open(path, "rb"),
+                backoff=self.retry_backoff,
+                on_retry=_on_retry,
+            )
+        except (PermissionError, FileNotFoundError, OSError) as e:
+            mime = self._mime.detect(entry.path)
+            return Fingerprint(
+                sha256=None, mime_type=mime, mime_category=categorize(mime),
+                owner=None, error=f"{type(e).__name__}: {e}",
+            )
+
+        try:
+            try:
                 head = f.read(self.HEAD_BYTES)
                 if entry.size <= self.hash_cap_bytes:
                     h = hashlib.sha256()
@@ -70,15 +102,15 @@ class StreamingFingerprinter:
                             break
                         h.update(chunk)
                     sha = h.hexdigest()
-        except (PermissionError, FileNotFoundError, OSError) as e:
-            mime = self._mime.detect(entry.path)  # extension fallback only
-            return Fingerprint(
-                sha256=None,
-                mime_type=mime,
-                mime_category=categorize(mime),
-                owner=None,
-                error=f"{type(e).__name__}: {e}",
-            )
+            except (PermissionError, FileNotFoundError, OSError) as e:
+                mime = self._mime.detect(entry.path, head=head if head else None)
+                return Fingerprint(
+                    sha256=None, mime_type=mime, mime_category=categorize(mime),
+                    owner=None, error=f"{type(e).__name__}: {e}",
+                )
+        finally:
+            f.close()
+
         mime = self._mime.detect(entry.path, head=head if head else None)
         return Fingerprint(
             sha256=sha,

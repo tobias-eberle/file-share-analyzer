@@ -141,6 +141,101 @@ def test_rescan_unchanged_reuses_prior_sha256_without_rehash(tmp_path: Path):
     assert rescan.state_counts["unchanged"] == 3
 
 
+def test_mtime_within_tolerance_classified_unchanged(tmp_path: Path):
+    """mtime jitter inside the tolerance window must NOT trigger 'modified'.
+
+    Simulates a re-mount onto a coarser-resolution protocol (FAT, SMB1)
+    by directly mutating the prior-run row's mtime by a fraction of a
+    second. With size unchanged, classify() should still call it
+    'unchanged' and reuse the prior fingerprint.
+    """
+    from datetime import datetime, timedelta, timezone
+
+    from share_analyzer.crawl.rescan import RescanContext
+
+    root = _build(tmp_path)
+    db = tmp_path / "i.sqlite"
+    base = run_crawl(root, db, CrawlOptions(workers=2))
+
+    # Skew every prior mtime by 0.5 s in the DB.
+    with connect(db) as conn:
+        rows = conn.execute(
+            "SELECT id, mtime FROM files WHERE run_id = ?", (base.run_id,)
+        ).fetchall()
+        for r in rows:
+            shifted = (datetime.fromisoformat(r["mtime"])
+                       + timedelta(milliseconds=500)).isoformat()
+            conn.execute("UPDATE files SET mtime = ? WHERE id = ?",
+                          (shifted, r["id"]))
+
+    # Now rescan — files on disk are unchanged, but the prior row's
+    # mtime no longer matches exactly. With tolerance, all unchanged.
+    rescan = run_crawl(
+        root, db, CrawlOptions(workers=2, previous_run_id=base.run_id),
+    )
+    assert rescan.state_counts["unchanged"] == 3
+    assert rescan.state_counts["modified"] == 0
+
+
+def test_mtime_outside_tolerance_classified_modified(tmp_path: Path):
+    from datetime import datetime, timedelta
+
+    root = _build(tmp_path)
+    db = tmp_path / "i.sqlite"
+    base = run_crawl(root, db, CrawlOptions(workers=2))
+
+    target = root / "docs" / "alpha.txt"
+    # Skew prior mtime by 5 s = outside the 2 s tolerance.
+    with connect(db) as conn:
+        prior = conn.execute(
+            "SELECT mtime FROM files WHERE run_id = ? AND path = ?",
+            (base.run_id, str(target)),
+        ).fetchone()[0]
+        shifted = (datetime.fromisoformat(prior)
+                   + timedelta(seconds=5)).isoformat()
+        conn.execute(
+            "UPDATE files SET mtime = ? WHERE run_id = ? AND path = ?",
+            (shifted, base.run_id, str(target)),
+        )
+
+    rescan = run_crawl(
+        root, db, CrawlOptions(workers=2, previous_run_id=base.run_id),
+    )
+    assert rescan.state_counts["modified"] == 1
+
+
+def test_size_change_overrides_mtime_tolerance(tmp_path: Path):
+    """A size change is conclusive — even if mtime is identical, the
+    file must be re-fingerprinted."""
+    from share_analyzer.crawl.fingerprint import Fingerprint
+    from share_analyzer.crawl.rescan import RescanContext
+    from share_analyzer.crawl.walker import FileEntry
+
+    root = _build(tmp_path)
+    db = tmp_path / "i.sqlite"
+    base = run_crawl(root, db, CrawlOptions(workers=2))
+
+    with connect(db) as conn:
+        ctx = RescanContext(conn, base.run_id)
+
+    sample_path = str(root / "docs" / "alpha.txt")
+    # Same path, same mtime, different size = modified.
+    prior = ctx._prior[sample_path]  # noqa: SLF001 — test reaches into context
+    altered = FileEntry(
+        path=sample_path,
+        parent_path=str(root / "docs"),
+        depth=2,
+        name="alpha.txt",
+        extension=".txt",
+        size=prior.size + 100,
+        mtime=prior.mtime,
+        atime=None, ctime=None,
+    )
+    state, fp = ctx.classify(altered)
+    assert state == "modified"
+    assert fp is None
+
+
 def test_deleted_rows_excluded_from_reports(tmp_path: Path):
     """materialize_folders + queries must filter out state='deleted'."""
     root = _build(tmp_path)
