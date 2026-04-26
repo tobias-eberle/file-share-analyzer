@@ -12,6 +12,7 @@ from share_analyzer.config import DEFAULT_EXCLUDES, load_config
 from share_analyzer.crawl.orchestrator import CrawlOptions, run_crawl
 from share_analyzer.crawl.rescan import latest_completed_run
 from share_analyzer.crawl.retry import DEFAULT_BACKOFF
+from share_analyzer.dry_run import dry_run, format_summary
 from share_analyzer.index.queries import (
     changed_files_summary, latest_run_id, run_summary,
 )
@@ -59,10 +60,15 @@ def main(ctx: click.Context, config: Path | None) -> None:
 
 @main.command()
 @click.argument("path", type=click.Path(path_type=Path, exists=True, file_okay=False))
-@click.option("--db", "db_path", type=click.Path(path_type=Path), required=True,
-              help="SQLite index file to write.")
+@click.option("--db", "db_path", type=click.Path(path_type=Path), required=False,
+              default=None, help="SQLite index file to write. "
+                                  "Optional with --dry-run.")
 @click.option("--workers", type=int, default=8, show_default=True,
               help="Parallel fingerprint workers.")
+@click.option("--dir-workers", type=int, default=4, show_default=True,
+              help="Parallel directory-enumeration workers. "
+                   "1 = sequential (lower memory). Higher = better on "
+                   "high-latency SMB shares.")
 @click.option("--hash-cap-mb", type=int, default=100, show_default=True,
               help="Skip SHA-256 for files larger than this (in MB).")
 @click.option("--exclude", "exclude_globs", multiple=True,
@@ -78,17 +84,40 @@ def main(ctx: click.Context, config: Path | None) -> None:
               help="Persist a checkpoint every N files.")
 @click.option("--follow-symlinks", is_flag=True, default=False,
               help="Follow symbolic links during traversal.")
+@click.option("--dry-run", is_flag=True, default=False,
+              help="Walk PATH without fingerprinting or writing to the "
+                   "DB; print a summary (file/folder counts, total size, "
+                   "top extensions, sample paths).")
 @click.option("-v", "--verbose", is_flag=True, default=False)
 @click.pass_context
-def scan(ctx: click.Context, path: Path, db_path: Path,
-         workers: int, hash_cap_mb: int, exclude_globs: tuple[str, ...],
+def scan(ctx: click.Context, path: Path, db_path: Path | None,
+         workers: int, dir_workers: int, hash_cap_mb: int,
+         exclude_globs: tuple[str, ...],
          no_default_excludes: bool, retry_attempts: int,
-         checkpoint_every: int, follow_symlinks: bool, verbose: bool) -> None:
+         checkpoint_every: int, follow_symlinks: bool,
+         dry_run: bool, verbose: bool) -> None:
     """Crawl PATH and build the SQLite index."""
     cfg = ctx.obj["config"].get("scan", {}) if ctx.obj else {}
     workers = cfg.get("workers", workers)
+    dir_workers = cfg.get("dir_workers", dir_workers)
     hash_cap_mb = cfg.get("hash_cap_mb", hash_cap_mb)
     effective_excludes = _resolve_excludes(cfg, exclude_globs, no_default_excludes)
+
+    if dry_run:
+        click.echo(f"share-analyzer {__version__}: dry-run on {path}")
+        from share_analyzer.dry_run import dry_run as _dry_run
+        summary = _dry_run(
+            path,
+            exclude_globs=effective_excludes,
+            follow_symlinks=follow_symlinks,
+            retry_backoff=_resolve_backoff(retry_attempts),
+            dir_workers=dir_workers,
+        )
+        click.echo(format_summary(summary))
+        return
+
+    if db_path is None:
+        raise click.UsageError("--db is required unless --dry-run is set")
 
     db_path.parent.mkdir(parents=True, exist_ok=True)
     configure_logging(db_path, verbose=verbose)
@@ -102,6 +131,7 @@ def scan(ctx: click.Context, path: Path, db_path: Path,
 
     options = CrawlOptions(
         workers=workers,
+        dir_workers=dir_workers,
         hash_cap_bytes=hash_cap_mb * 1024 * 1024,
         exclude_globs=effective_excludes,
         checkpoint_every=checkpoint_every,
@@ -112,10 +142,21 @@ def scan(ctx: click.Context, path: Path, db_path: Path,
     click.echo(f"share-analyzer {__version__}: scanning {path} → {db_path}")
     result = run_crawl(path, db_path, options, progress=on_progress)
     progress.finish()
+    if result.status == "disconnected":
+        click.echo(
+            f"interrupted — run #{result.run_id} marked 'disconnected': "
+            f"{result.file_count:,} files indexed, "
+            f"{result.error_count:,} errors before the share went away"
+        )
+        if result.advisory:
+            click.echo(f"  advisory: {result.advisory}")
+        sys.exit(2)
     click.echo(
         f"done — run #{result.run_id}: "
         f"{result.file_count:,} files, {result.error_count:,} errors"
     )
+    if result.advisory:
+        click.echo(f"  advisory: {result.advisory}")
 
 
 @main.command()
@@ -126,6 +167,7 @@ def scan(ctx: click.Context, path: Path, db_path: Path,
 @click.option("--from-run", type=int, default=None,
               help="Run id to diff against (defaults to most recent completed).")
 @click.option("--workers", type=int, default=8, show_default=True)
+@click.option("--dir-workers", type=int, default=4, show_default=True)
 @click.option("--hash-cap-mb", type=int, default=100, show_default=True)
 @click.option("--exclude", "exclude_globs", multiple=True)
 @click.option("--no-default-excludes", is_flag=True, default=False)
@@ -136,7 +178,8 @@ def scan(ctx: click.Context, path: Path, db_path: Path,
 @click.option("-v", "--verbose", is_flag=True, default=False)
 @click.pass_context
 def rescan(ctx: click.Context, path: Path | None, db_path: Path, from_run: int | None,
-           workers: int, hash_cap_mb: int, exclude_globs: tuple[str, ...],
+           workers: int, dir_workers: int, hash_cap_mb: int,
+           exclude_globs: tuple[str, ...],
            no_default_excludes: bool, retry_attempts: int,
            checkpoint_every: int, follow_symlinks: bool, verbose: bool) -> None:
     """Crawl PATH again and record only the delta against a prior run.
@@ -185,6 +228,7 @@ def rescan(ctx: click.Context, path: Path | None, db_path: Path, from_run: int |
     effective_excludes = _resolve_excludes(cfg, exclude_globs, no_default_excludes)
     options = CrawlOptions(
         workers=workers,
+        dir_workers=dir_workers,
         hash_cap_bytes=hash_cap_mb * 1024 * 1024,
         exclude_globs=effective_excludes,
         checkpoint_every=checkpoint_every,
@@ -198,6 +242,14 @@ def rescan(ctx: click.Context, path: Path | None, db_path: Path, from_run: int |
     )
     result = run_crawl(path, db_path, options, progress=on_progress)
     progress.finish()
+    if result.status == "disconnected":
+        click.echo(
+            f"interrupted — run #{result.run_id} marked 'disconnected' "
+            f"({result.error_count:,} errors before the share went away)"
+        )
+        if result.advisory:
+            click.echo(f"  advisory: {result.advisory}")
+        sys.exit(2)
 
     sc = result.state_counts or {}
     click.echo(
@@ -208,6 +260,8 @@ def rescan(ctx: click.Context, path: Path | None, db_path: Path, from_run: int |
         f"-{sc.get('deleted', 0):,} deleted "
         f"({result.error_count:,} errors)"
     )
+    if result.advisory:
+        click.echo(f"  advisory: {result.advisory}")
 
 
 @main.command()

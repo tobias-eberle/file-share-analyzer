@@ -27,6 +27,7 @@ from pathlib import Path
 from typing import Callable, Optional, Sequence
 
 from share_analyzer.crawl.fingerprint import Fingerprint, Fingerprinter, StreamingFingerprinter
+from share_analyzer.crawl.health import HealthMonitor
 from share_analyzer.crawl.rescan import RescanContext
 from share_analyzer.crawl.retry import DEFAULT_BACKOFF
 from share_analyzer.crawl.sink import Sink, SqliteSink
@@ -44,6 +45,7 @@ class CrawlResult:
     status: str
     previous_run_id: Optional[int] = None
     state_counts: Optional[dict[str, int]] = None
+    advisory: Optional[str] = None
 
 
 @dataclass
@@ -56,6 +58,9 @@ class CrawlOptions:
     follow_symlinks: bool = False
     previous_run_id: Optional[int] = None
     retry_backoff: Sequence[float] = DEFAULT_BACKOFF
+    dir_workers: int = 1
+    health_error_threshold: int = 50
+    health_window_s: float = 10.0
 
 
 _SENTINEL: object = object()
@@ -89,12 +94,18 @@ def run_crawl(
         exclude_globs=options.exclude_globs,
         follow_symlinks=options.follow_symlinks,
         retry_backoff=options.retry_backoff,
+        dir_workers=options.dir_workers,
     )
     fingerprinter = fingerprinter or StreamingFingerprinter(
         options.hash_cap_bytes,
         retry_backoff=options.retry_backoff,
     )
     sink = sink or SqliteSink(db_path)
+    health = HealthMonitor(
+        str(root),
+        error_threshold=options.health_error_threshold,
+        window_s=options.health_window_s,
+    )
 
     rescan_ctx: Optional[RescanContext] = None
     if options.previous_run_id is not None:
@@ -119,6 +130,7 @@ def run_crawl(
     file_count = 0
     error_count = 0
     abort = threading.Event()
+    disconnected = threading.Event()
     writer_exc: list[BaseException] = []
     last_wal_truncate_at = 0  # mutated by the writer thread only
 
@@ -127,8 +139,11 @@ def run_crawl(
             item = in_q.get()
             try:
                 if item is _SENTINEL:
-                    if not abort.is_set():
-                        _put(out_q, _SENTINEL, abort)
+                    # Always forward the sentinel — even on abort the
+                    # writer thread still needs N sentinels to exit
+                    # cleanly. Use a plain put so an abort-stalled queue
+                    # doesn't strand the writer.
+                    out_q.put(_SENTINEL)
                     return
                 if abort.is_set():
                     continue
@@ -166,12 +181,16 @@ def run_crawl(
                     if isinstance(item, WalkError):
                         sink.write_errors([item])
                         error_count += 1
+                        # WalkError recording happens on the main thread
+                        # so the disconnect check sees fresh data; we
+                        # don't double-count here.
                         continue
                     entry, fp, state = item
                     batch.append((entry, fp, state))
                     last_path = entry.path
                     if fp.error:
                         error_count += 1
+                        health.record_error(fp.error)
                     if len(batch) >= sink.BATCH_SIZE:
                         file_count += sink.write_files(batch)
                         batch.clear()
@@ -205,6 +224,18 @@ def run_crawl(
             if abort.is_set():
                 break
             if isinstance(item, WalkError):
+                # Record on the main thread so the disconnect check
+                # below sees the just-arrived error before we decide
+                # whether to keep going.
+                health.record_error(item.reason)
+                if health.is_disconnected():
+                    log.error("share-disconnected", extra={
+                        "run_id": run_id, "root": str(root),
+                        "recent_errors": health.recent_error_count(),
+                    })
+                    disconnected.set()
+                    abort.set()
+                    break
                 if not _put(out_q, item, abort):
                     break
                 continue
@@ -237,6 +268,27 @@ def run_crawl(
         log.error("crawl-failed", extra={"run_id": run_id})
         raise writer_exc[0]
 
+    if disconnected.is_set():
+        # Don't materialize folders on a partial snapshot — it would
+        # masquerade as a complete one in subsequent reports.
+        sink.end_run(
+            file_count=file_count, error_count=error_count,
+            status="disconnected",
+        )
+        sink.wal_checkpoint()
+        sink.close()
+        log.error("crawl-disconnected", extra={"run_id": run_id})
+        return CrawlResult(
+            run_id=run_id,
+            file_count=file_count,
+            error_count=error_count,
+            status="disconnected",
+            previous_run_id=options.previous_run_id,
+            advisory=("share became unreachable mid-crawl; partial run "
+                      "left in the index for forensics — re-run `scan` "
+                      "once the mount is restored"),
+        )
+
     deleted_count = 0
     if rescan_ctx is not None:
         deleted_count = sink.copy_deleted_from_previous(  # type: ignore[attr-defined]
@@ -265,4 +317,5 @@ def run_crawl(
         status="completed",
         previous_run_id=options.previous_run_id,
         state_counts=state_counts,
+        advisory=health.advisory(),
     )
