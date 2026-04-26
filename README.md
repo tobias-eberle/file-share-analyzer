@@ -104,6 +104,23 @@ SMB1/FAT/NTFS rounding differences), fingerprints only the delta, and
 records added / modified / deleted rows so reports can show churn.
 Defaults to diffing against the most recent completed run.
 
+**Path-derived tags.** Every indexed file gets a `tags` column —
+folder names from its path, lowercased and deduped, with drive
+letters / Windows long-path prefixes / hidden+system folders /
+common organisational chrome (`shared`, `backup`, `final`, …)
+stripped out. Surfaced in the RAG candidate JSONL so downstream
+ingestion can filter by tag without re-parsing paths:
+
+```json
+{
+  "path": "Z:\\maschinen\\12345\\anleitungen\\gasmesser\\xyz.pdf",
+  "tags": ["maschinen", "12345", "anleitungen", "gasmesser"],
+  "mime_type": "application/pdf",
+  "size": 5242880,
+  "...": "..."
+}
+```
+
 A `share-analyzer.toml` in the working directory (or any parent) supplies
 persistent defaults; CLI flags override.
 

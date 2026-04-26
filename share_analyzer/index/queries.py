@@ -361,7 +361,7 @@ def rag_candidates(conn: sqlite3.Connection, run_id: int, *,
         sql = f"""
             WITH filtered AS (
                 SELECT id, path, parent_path, name, extension, size, mtime,
-                       sha256, mime_type, mime_category,
+                       sha256, mime_type, mime_category, tags,
                        ROW_NUMBER() OVER (
                            PARTITION BY COALESCE(sha256, 'p:' || path)
                            ORDER BY mtime DESC, id ASC
@@ -374,7 +374,7 @@ def rag_candidates(conn: sqlite3.Connection, run_id: int, *,
                   AND (mtime IS NULL OR mtime >= ?)
             )
             SELECT id, path, parent_path, name, extension, size, mtime,
-                   sha256, mime_type, mime_category
+                   sha256, mime_type, mime_category, tags
             FROM filtered
             WHERE rn = 1
             ORDER BY mtime DESC
@@ -382,7 +382,7 @@ def rag_candidates(conn: sqlite3.Connection, run_id: int, *,
     else:
         sql = f"""
             SELECT id, path, parent_path, name, extension, size, mtime,
-                   sha256, mime_type, mime_category
+                   sha256, mime_type, mime_category, tags
             FROM files
             WHERE run_id = ?
               AND state != 'deleted'
