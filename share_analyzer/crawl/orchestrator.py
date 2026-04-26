@@ -86,7 +86,7 @@ def run_crawl(
     walker: Optional[Walker] = None,
     fingerprinter: Optional[Fingerprinter] = None,
     sink: Optional[Sink] = None,
-    progress: Optional[Callable[[int, int, int], None]] = None,
+    progress: Optional[Callable[[int, int, str], None]] = None,
 ) -> CrawlResult:
     options = options or CrawlOptions()
     walker = walker or LocalScandirWalker(
@@ -184,6 +184,8 @@ def run_crawl(
                         # WalkError recording happens on the main thread
                         # so the disconnect check sees fresh data; we
                         # don't double-count here.
+                        if progress:
+                            progress(file_count, error_count, item.path)
                         continue
                     entry, fp, state = item
                     batch.append((entry, fp, state))
@@ -194,17 +196,22 @@ def run_crawl(
                     if len(batch) >= sink.BATCH_SIZE:
                         file_count += sink.write_files(batch)
                         batch.clear()
+                        # Emit progress every batch flush (~every 1000
+                        # files). ProgressPrinter rate-limits redraws
+                        # internally, so this is cheap to spam.
+                        if progress:
+                            progress(file_count, error_count, last_path or "")
                         if file_count - last_wal_truncate_at >= options.checkpoint_every:
                             sink.checkpoint(last_path, file_count)
                             sink.wal_checkpoint()
                             last_wal_truncate_at = file_count
-                            if progress:
-                                progress(file_count, error_count, 0)
                 finally:
                     out_q.task_done()
             if batch:
                 file_count += sink.write_files(batch)
             sink.checkpoint(last_path, file_count)
+            if progress:
+                progress(file_count, error_count, last_path or "")
         except BaseException as e:  # noqa: BLE001 — capture for re-raise
             writer_exc.append(e)
             abort.set()

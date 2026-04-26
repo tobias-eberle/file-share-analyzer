@@ -123,12 +123,6 @@ def scan(ctx: click.Context, path: Path, db_path: Path | None,
     configure_logging(db_path, verbose=verbose)
     progress = ProgressPrinter()
 
-    def on_progress(files: int, errors: int, _bytes: int) -> None:
-        # invoked inside the writer thread; safe — ProgressPrinter is locked
-        progress._count = files  # noqa: SLF001 — direct because we already counted
-        progress._errors = errors  # noqa: SLF001
-        progress.update(force=True)
-
     options = CrawlOptions(
         workers=workers,
         dir_workers=dir_workers,
@@ -140,7 +134,7 @@ def scan(ctx: click.Context, path: Path, db_path: Path | None,
     )
 
     click.echo(f"share-analyzer {__version__}: scanning {path} → {db_path}")
-    result = run_crawl(path, db_path, options, progress=on_progress)
+    result = run_crawl(path, db_path, options, progress=progress.update)
     progress.finish()
     if result.status == "disconnected":
         click.echo(
@@ -219,11 +213,6 @@ def rescan(ctx: click.Context, path: Path | None, db_path: Path, from_run: int |
     configure_logging(db_path, verbose=verbose)
     progress = ProgressPrinter()
 
-    def on_progress(files: int, errors: int, _bytes: int) -> None:
-        progress._count = files     # noqa: SLF001
-        progress._errors = errors   # noqa: SLF001
-        progress.update(force=True)
-
     cfg = ctx.obj["config"].get("scan", {}) if ctx.obj else {}
     effective_excludes = _resolve_excludes(cfg, exclude_globs, no_default_excludes)
     options = CrawlOptions(
@@ -240,7 +229,7 @@ def rescan(ctx: click.Context, path: Path | None, db_path: Path, from_run: int |
     click.echo(
         f"share-analyzer {__version__}: rescanning {path} against run #{from_run}"
     )
-    result = run_crawl(path, db_path, options, progress=on_progress)
+    result = run_crawl(path, db_path, options, progress=progress.update)
     progress.finish()
     if result.status == "disconnected":
         click.echo(

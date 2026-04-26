@@ -99,6 +99,29 @@ watcher thread sees the count hit zero and pushes a single sentinel
 onto `result_q`. The `visited` symlink-loop set is guarded by a lock
 because multiple workers may want to claim the same target at once.
 
+### Progress rendering
+
+`ProgressPrinter` (`logging.py`) takes **absolute** counts plus a
+`last_path` from the orchestrator, not deltas. Callers can hammer
+`update()` thousands of times per second; the printer rate-limits
+internally to one `\r`-redraw per `every` seconds (default 0.5 s).
+Three deliberately small ideas:
+
+1. **Hot-path callers don't worry about throttling.** The orchestrator
+   calls progress on every batch flush *and* every walker-error
+   ingest. That's ~1000 calls/sec at the high end; one render/sec
+   reaches stderr.
+2. **Path truncation from the left.** A 250-character SMB path becomes
+   `…/path/that/goes/well/past/twenty/chars/file.txt` — the tail is
+   the informative part. Set `path_width` to taste.
+3. **Pad-over for variable-length lines.** Each render remembers its
+   length so the next, possibly shorter, render pads with spaces and
+   doesn't leave stale characters from a previous longer line.
+
+Non-tty streams (CI logs, redirected stdout) skip the rendering
+entirely — `\r` floods are noise in log files. The CLI still prints
+the final summary line; that's enough for non-interactive runs.
+
 ### Disconnect detection (`HealthMonitor`)
 
 The main thread calls `health.record_error(reason)` for every
