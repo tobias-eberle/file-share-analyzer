@@ -23,12 +23,14 @@ share_analyzer/
   cli.py                  # Click entry point: scan / rescan / report / info
   config.py               # share-analyzer.toml loader + DEFAULT_EXCLUDES
   logging.py              # JSON sidecar logger + ProgressPrinter
+  dry_run.py              # --dry-run summary (no DB, no fingerprinting)
   crawl/
-    walker.py             # Walker protocol + LocalScandirWalker
+    walker.py             # Walker protocol + LocalScandirWalker (seq + parallel)
     fingerprint.py        # Fingerprinter + StreamingFingerprinter
     sink.py               # Sink + SqliteSink (batched, WAL)
     rescan.py             # RescanContext: prior-run delta classifier
     retry.py              # is_transient + with_retry for SMB I/O
+    health.py             # HealthMonitor: disconnect detection + advisory
     orchestrator.py       # threading + queues + abort handling
   index/
     schema.py             # versioned migrations, connect()
@@ -69,7 +71,7 @@ break them without a deliberate decision.
 The orchestrator is the only place threads run.
 
 - Main thread: walker. Files → `in_q`, walker errors → `out_q`.
-- Worker pool: drains `in_q`, fingerprints, pushes `(entry, fp)` → `out_q`.
+- Worker pool: drains `in_q`, fingerprints, pushes `(entry, fp, state)` → `out_q`.
 - Single writer thread: drains `out_q`, is the **only** caller of sink
   write methods during the run.
 - `abort: threading.Event` + `_put(q, item, abort)` make every blocking
@@ -79,7 +81,38 @@ The orchestrator is the only place threads run.
 
 If you add a new producer or consumer, route it through `_put` — never
 call `q.put(item)` without the abort guard. Otherwise a sink failure
-will hang the crawl.
+will hang the crawl. **One exception:** workers always forward their
+in_q sentinel to out_q via plain `out_q.put(_SENTINEL)`, even on abort.
+The writer counts N sentinels to exit; if abort blocks the put the
+writer hangs forever waiting for them. Sentinels are control flow, not
+data — they never carry partial work.
+
+### Parallel walker (`dir_workers > 1`)
+
+`LocalScandirWalker.walk()` switches between `_walk_sequential` (a
+plain stack iteration) and `_walk_parallel` (a thread-pool pulling from
+`dir_q` and pushing results to a bounded `result_q`). Both share
+`_process_directory`, so the SMB quirks live in one place. Termination
+of the parallel mode rides on `queue.Queue.join()` — every directory
+push increments unfinished_tasks, every `task_done` decrements; a
+watcher thread sees the count hit zero and pushes a single sentinel
+onto `result_q`. The `visited` symlink-loop set is guarded by a lock
+because multiple workers may want to claim the same target at once.
+
+### Disconnect detection (`HealthMonitor`)
+
+The main thread calls `health.record_error(reason)` for every
+`WalkError` and the writer does the same for `fp.error` from the
+fingerprint workers. Recording on the main thread for walker errors is
+critical — `is_disconnected()` is checked immediately after, and we
+need it to see the error that was just yielded, not whatever the
+writer thread has caught up to. The check is a cheap count test;
+crossing the threshold triggers a single `os.stat(root)` (rate-limited
+to once per `recheck_interval_s`) to confirm the share is actually
+gone. On confirmation: `disconnected.set()` + `abort.set()`, end the
+run with `status='disconnected'`, **skip `materialize_folders`** —
+folder aggregates over a partial snapshot would lie in subsequent
+reports.
 
 ## SMB / Windows quirks
 
@@ -220,6 +253,18 @@ Still on the list:
   recent completed run and reuses its `root_path`. To diff against a
   specific run, pass `--from-run <id>`. A different root_path is
   rejected — start a fresh index with `scan` instead.
+- `share-analyzer scan PATH --dry-run` walks the share without
+  fingerprinting and without writing to a DB; prints file/folder
+  counts, total size, top extensions, sample paths. Useful as a
+  pre-flight check before committing to a multi-hour crawl.
+- `--dir-workers N` parallelises directory enumeration. Default 4 — on
+  high-latency SMB shares, the walk is the bottleneck rather than
+  fingerprinting, so spreading scandir across threads typically pays.
+  `--dir-workers 1` keeps the original sequential walk for debugging.
+- The CLI exits with status 2 when a run ends `disconnected` and
+  surfaces a one-line `advisory` from the HealthMonitor when error
+  rates are elevated but the share is still up — that's the user's
+  cue to lower `--workers` or check the server.
 - A `share-analyzer.toml` in the working directory or any parent supplies
   defaults for `[scan]`. CLI flags override.
 

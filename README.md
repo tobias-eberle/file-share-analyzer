@@ -45,14 +45,15 @@ per duplicate cluster.
 ## CLI
 
 ```
-share-analyzer scan <path> --db <file.db>
-                  [--workers 8] [--hash-cap-mb 100]
+share-analyzer scan <path> [--db <file.db>]
+                  [--workers 8] [--dir-workers 4] [--hash-cap-mb 100]
                   [--exclude <glob>]... [--no-default-excludes]
                   [--retry-attempts 3] [--checkpoint-every 10000]
-                  [--follow-symlinks] [-v]
+                  [--follow-symlinks] [--dry-run] [-v]
 
 share-analyzer rescan [<path>] --db <file.db>
-                  [--from-run <id>] [--workers 8] [--hash-cap-mb 100]
+                  [--from-run <id>] [--workers 8] [--dir-workers 4]
+                  [--hash-cap-mb 100]
                   [--exclude <glob>]... [--no-default-excludes]
                   [--retry-attempts 3] [--checkpoint-every 10000]
                   [--follow-symlinks] [-v]
@@ -63,23 +64,43 @@ share-analyzer report <name|all> --db <file.db> --out <dir>
 share-analyzer info --db <file.db> [--run-id <id>]
 ```
 
-`scan` and `rescan` apply a curated default-exclude list that filters
-the usual Windows nuisance files: Office lock files (`~$*`),
+**Pre-flight `--dry-run`.** `share-analyzer scan PATH --dry-run` walks
+the share without fingerprinting and without writing a database. It
+prints file/folder counts, total size, top extensions, and a few
+sample paths — useful as a sanity check before committing to a
+multi-hour scan.
+
+**Parallel directory enumeration.** `--dir-workers N` parallelises
+`os.scandir` across N threads. Default 4. On a high-latency SMB share
+the walk is usually the bottleneck rather than fingerprinting, so
+this typically pays off. Set to 1 for sequential debugging.
+
+**Default excludes.** `scan` and `rescan` apply a curated list that
+filters the usual Windows nuisance files: Office lock files (`~$*`),
 `Thumbs.db`, `desktop.ini`, `*.tmp`, `$RECYCLE.BIN`, `.DS_Store`, and a
 handful of system files. Disable with `--no-default-excludes` or
 `[scan].default_excludes = false` in `share-analyzer.toml`.
 
-Transient I/O errors (network blips, locked files, Windows
-`ERROR_NETNAME_DELETED`, …) are retried with exponential backoff
+**Transient I/O retries.** Network blips, locked files, Windows
+`ERROR_NETNAME_DELETED`, … are retried with exponential backoff
 (0.2 s / 1 s / 5 s by default). Tune with `--retry-attempts 0..N`;
 `0` disables retries. Permanent errors (`ENOENT`, `EACCES`, …) are not
 retried.
 
-UNC paths work without `net use`: pass `\\server\share\path` directly
-on Windows.
+**Disconnect detection.** If the share unmounts mid-crawl, the run
+ends with `status='disconnected'` (CLI exit code 2) instead of
+masquerading as a successful scan with thousands of bogus errors.
+Folder aggregates aren't materialised on a partial snapshot — re-run
+`scan` once the mount is restored. Elevated-but-not-disconnected
+error rates surface as a one-line advisory: `"high error rate: N
+network-class errors in the last 10s — consider lowering --workers"`.
 
-`rescan` re-walks the share, reuses prior SHA-256 + MIME for files
-whose `(size, mtime)` are unchanged, fingerprints only the delta, and
+**UNC paths** work without `net use`: pass `\\server\share\path`
+directly on Windows.
+
+**`rescan`** re-walks the share, reuses prior SHA-256 + MIME for files
+whose `(size, mtime)` are unchanged (within a 2 s tolerance to absorb
+SMB1/FAT/NTFS rounding differences), fingerprints only the delta, and
 records added / modified / deleted rows so reports can show churn.
 Defaults to diffing against the most recent completed run.
 
