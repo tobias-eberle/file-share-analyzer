@@ -1,6 +1,7 @@
 """Sink — batches file rows into the SQLite index."""
 from __future__ import annotations
 
+import json
 import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
@@ -10,6 +11,7 @@ from share_analyzer.crawl.fingerprint import Fingerprint
 from share_analyzer.crawl.walker import FileEntry, WalkError
 from share_analyzer.index.schema import init_db
 from share_analyzer.index.mime import seed_mime_categories
+from share_analyzer.tags import extract_tags
 
 
 class Sink(Protocol):
@@ -68,12 +70,13 @@ class SqliteSink:
         run_id = self.run_id
         n = 0
         for entry, fp, state in rows:
+            tags_json = json.dumps(extract_tags(entry.path), ensure_ascii=False)
             self._buf_files.append((
                 run_id, entry.path, entry.parent_path, entry.depth,
                 entry.name, entry.extension, entry.size,
                 entry.mtime, entry.atime, entry.ctime,
                 fp.sha256, fp.mime_type, fp.mime_category, fp.owner,
-                state,
+                state, tags_json,
             ))
             n += 1
             if fp.error:
@@ -104,8 +107,8 @@ class SqliteSink:
             INSERT INTO files (
                 run_id, path, parent_path, depth,
                 name, extension, size, mtime, atime, ctime,
-                sha256, mime_type, mime_category, owner, state
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                sha256, mime_type, mime_category, owner, state, tags
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             self._buf_files,
         )
@@ -162,6 +165,9 @@ class SqliteSink:
     def copy_deleted_from_previous(self, previous_run_id: int) -> int:
         """Insert a 'deleted' row for every file in the previous run that
         wasn't seen in this run. Atomic single-statement insert.
+
+        Tags carry forward from the prior row — they're a property of
+        the path, and a deleted file's path doesn't change.
         """
         self._flush_files()
         cur = self.conn.execute(
@@ -169,12 +175,12 @@ class SqliteSink:
             INSERT INTO files (
                 run_id, path, parent_path, depth, name, extension, size,
                 mtime, atime, ctime, sha256, mime_type, mime_category,
-                owner, state
+                owner, state, tags
             )
             SELECT ?, prev.path, prev.parent_path, prev.depth, prev.name,
                    prev.extension, prev.size, prev.mtime, prev.atime,
                    prev.ctime, prev.sha256, prev.mime_type, prev.mime_category,
-                   prev.owner, 'deleted'
+                   prev.owner, 'deleted', prev.tags
             FROM files prev
             LEFT JOIN files cur
                    ON cur.path = prev.path AND cur.run_id = ?

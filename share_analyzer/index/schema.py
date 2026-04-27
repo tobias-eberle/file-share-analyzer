@@ -9,7 +9,7 @@ import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
 
-CURRENT_VERSION = 2
+CURRENT_VERSION = 3
 
 
 _MIGRATIONS: dict[int, list[str]] = {
@@ -146,6 +146,16 @@ _MIGRATIONS: dict[int, list[str]] = {
             GROUP BY run_id, sha256
             HAVING COUNT(*) >= 2
         """,
+    ],
+    3: [
+        # Path-derived tags: JSON array of folder names from the path,
+        # lowercased + deduped + filtered. Computed at insert time by
+        # the sink. Nullable for forward-compat (older rows imported
+        # via tooling) but new rows always populate it. No index — the
+        # column is a JSON blob; downstream queries use json_each() if
+        # they need to filter, but the primary consumer is the
+        # rag_candidates JSONL export which reads it whole.
+        "ALTER TABLE files ADD COLUMN tags TEXT",
     ],
 }
 

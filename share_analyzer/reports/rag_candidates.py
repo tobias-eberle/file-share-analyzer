@@ -1,6 +1,7 @@
 """RAG candidate export — the hand-off artifact for the ingestion pipeline."""
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 from share_analyzer.index.queries import rag_candidates
@@ -51,6 +52,20 @@ def report_rag_candidates(
             min_size=min_size, max_size=max_size,
             max_age_days=max_age_days,
         ):
+            # `tags` is stored as a JSON-encoded array per row; decode
+            # once here so the JSONL line carries a real list rather
+            # than a stringified one. Defensive against pre-tags rows
+            # (NULL) and any malformed JSON the column might contain.
+            raw_tags = row.get("tags")
+            if raw_tags:
+                try:
+                    tags = json.loads(raw_tags)
+                    if not isinstance(tags, list):
+                        tags = []
+                except (TypeError, ValueError):
+                    tags = []
+            else:
+                tags = []
             yield {
                 "path": row["path"],
                 "size": row["size"],
@@ -59,6 +74,7 @@ def report_rag_candidates(
                 "mime_type": row["mime_type"],
                 "mime_category": row["mime_category"],
                 "extension": row["extension"],
+                "tags": tags,
                 "suggested_category": _suggest_category(
                     row["mime_type"], row["extension"]
                 ),

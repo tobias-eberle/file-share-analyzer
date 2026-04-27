@@ -24,6 +24,7 @@ share_analyzer/
   config.py               # share-analyzer.toml loader + DEFAULT_EXCLUDES
   logging.py              # JSON sidecar logger + ProgressPrinter
   dry_run.py              # --dry-run summary (no DB, no fingerprinting)
+  tags.py                 # extract_tags: folder-path → list[str]
   crawl/
     walker.py             # Walker protocol + LocalScandirWalker (seq + parallel)
     fingerprint.py        # Fingerprinter + StreamingFingerprinter
@@ -136,6 +137,41 @@ gone. On confirmation: `disconnected.set()` + `abort.set()`, end the
 run with `status='disconnected'`, **skip `materialize_folders`** —
 folder aggregates over a partial snapshot would lie in subsequent
 reports.
+
+## Path-derived tags
+
+`tags.py::extract_tags(path)` turns `Z:\maschinen\12345\anleitungen\gasmesser\xyz.pdf`
+into `['maschinen', '12345', 'anleitungen', 'gasmesser']`. The sink
+calls it once per file at insert time and stores the JSON-encoded
+list in `files.tags`. The `rag_candidates.jsonl` export decodes and
+emits the list so downstream RAG can filter without re-parsing
+paths.
+
+The function is deliberately small (~30 LOC) but hardened for the
+messy paths that real shares throw at it:
+
+- Strips the Windows long-path prefix (`\\?\` and `\\?\UNC\`)
+  *before* splitting, so `unc` and `?` never leak as tags.
+- Drops drive letters (`C:`, `Z:`) — they're location, not content.
+- Skips `_`-, `.`-, and `$`-prefixed folders (private / hidden /
+  system) before lowercasing.
+- Lowercases for matching, then dedupes — `Foo/foo/bar` emits one
+  `foo`.
+- Drops blocklisted organisational chrome (`shared`, `backup`,
+  `temp`, `final`, …); see `BLOCKLIST` in `tags.py`.
+- Caps tag length at `MAX_TAG_LEN = 64` and tag count at
+  `MAX_TAGS = 16`. Pathologically deep paths get clipped — `tags`
+  is a tag set, not a path index.
+
+When you change the rules: edit `tags.py` and rerun
+`tests/test_tags.py`. The `realistic_german_smb_path` test is the
+canonical "this is what real users hit" check.
+
+The `tags` column is added in migration v3. v2 databases upgrade
+cleanly with the column NULLed on legacy rows; new inserts
+populate it. Deleted-row carryover (`copy_deleted_from_previous`)
+copies tags forward from the prior run — a deleted file's path
+doesn't change, so neither do its tags.
 
 ## SMB / Windows quirks
 
