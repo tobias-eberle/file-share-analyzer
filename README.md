@@ -22,10 +22,36 @@ poetry run share-analyzer report all --db share.sqlite --out ./out
 
 # inspect the latest run
 poetry run share-analyzer info --db share.sqlite
+
+# or launch the desktop UI: pick a folder, start/rescan/report by clicking
+poetry run share-analyzer ui
 ```
 
 The HTML reports are self-contained single files — Plotly is inlined, no CDN —
 so they can be emailed or dropped on a SharePoint without hosting.
+
+## Desktop UI
+
+`share-analyzer ui` opens a Tkinter window with:
+
+- A native OS folder picker for the share to scan and the index DB.
+- Workers / dir-workers / hash-cap controls and the same default-exclude
+  toggle as the CLI.
+- A live progress line (`12,345 files   3 err   …/share/foo/bar.md`)
+  refreshed during the scan.
+- A runs table that lists every prior run in the chosen DB with
+  status, file/error counts, and a "vs #N" marker on rescans.
+- Buttons to **rescan** against a selected run, **generate reports**
+  into a folder of your choice (with an "open the folder?" prompt
+  on completion), and show **details** for any run.
+- A **Dry-run** checkbox that walks the share without writing anything
+  and shows file/folder counts + top extensions in a popup.
+
+The UI is a thin wrapper around the same orchestrator the CLI uses —
+no parallel implementation, no duplicate state.
+
+On Linux you may need `apt-get install python3-tk` if your distro
+ships a stripped Python.
 
 ## Reports
 

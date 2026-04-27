@@ -20,11 +20,15 @@ code paths.
 
 ```
 share_analyzer/
-  cli.py                  # Click entry point: scan / rescan / report / info
+  cli.py                  # Click entry point: scan / rescan / report / info / ui
   config.py               # share-analyzer.toml loader + DEFAULT_EXCLUDES
   logging.py              # JSON sidecar logger + ProgressPrinter
   dry_run.py              # --dry-run summary (no DB, no fingerprinting)
   tags.py                 # extract_tags: folder-path → list[str]
+  ui/
+    controller.py         # Tk-free: threads, event queue, list_runs/details
+    app.py                # Tk widgets — folder pickers, runs table, progress
+    __main__.py           # `python -m share_analyzer.ui`
   crawl/
     walker.py             # Walker protocol + LocalScandirWalker (seq + parallel)
     fingerprint.py        # Fingerprinter + StreamingFingerprinter
@@ -254,6 +258,36 @@ rollup of categories is more confusing than useful in the topology view.
 When you change this function, run `tests/test_folders.py` — it pins all
 three guarantees against a fixture share where the only files live three
 levels deep.
+
+## Desktop UI (`ui/`)
+
+`share-analyzer ui` launches a Tkinter app: folder picker (native OS
+dialog), index DB picker, scan/rescan/report buttons, a runs table
+read live from the DB, plus the same `ProgressPrinter`-shape live
+counter in a status line.
+
+Architecture is two layers:
+
+- **`ui/controller.py`** — Tk-free. All threading, all queue-event
+  posting, all DB reads. The `Controller` exposes `start_scan`,
+  `start_rescan`, `start_reports`, `list_runs`, `run_details`. Long
+  operations spawn a daemon thread; events arrive on `controller.events`.
+  This is the only layer that has tests.
+- **`ui/app.py`** — pure view. `App` builds the widget tree, wires
+  buttons to controller methods, polls `controller.events` from
+  Tk's main loop via `root.after(100, …)`, updates labels and the
+  runs Treeview. **No business logic lives here.** When you add a
+  feature, put the work in the controller and add a button.
+
+Why this split: Tkinter widgets can't be exercised in CI without a
+display server. By keeping the work in `Controller`, the
+`tests/test_ui_controller.py` suite covers start_scan/start_rescan/
+start_reports/error-paths headlessly. The view is smoke-imported
+only — no test mainloop.
+
+`tkinter` is stdlib but a stripped Python build can omit it. The CLI
+subcommand catches the ImportError and gives a clear "apt-get install
+python3-tk" hint instead of a bare traceback.
 
 ## Testing
 
