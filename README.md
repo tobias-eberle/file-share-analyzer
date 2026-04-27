@@ -95,6 +95,20 @@ Folder aggregates aren't materialised on a partial snapshot — re-run
 error rates surface as a one-line advisory: `"high error rate: N
 network-class errors in the last 10s — consider lowering --workers"`.
 
+**Live progress.** When stderr is a tty, `scan` and `rescan` redraw a
+single line every half-second:
+
+```
+[scan]    123,456 files     842 f/s    7 err  …/share/Projects/alpha/docs/notes.md
+```
+
+Counts are absolute, the rate is computed over the whole run, and the
+path is the most recently flushed file (or the path that just
+errored). Long paths are truncated from the left so the tail —
+the informative part — stays visible. On non-tty streams (CI logs,
+redirected stdout), the live line is suppressed; only the final
+summary is printed.
+
 **UNC paths** work without `net use`: pass `\\server\share\path`
 directly on Windows.
 
