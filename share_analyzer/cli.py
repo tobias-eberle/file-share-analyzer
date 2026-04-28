@@ -335,5 +335,23 @@ def info(db_path: Path, run_id: int | None) -> None:
     conn.close()
 
 
+@main.command()
+def ui() -> None:
+    """Launch the Tkinter desktop UI: pick a folder, start scans,
+    view and rescan prior runs, generate reports.
+    """
+    try:
+        from share_analyzer.ui.app import main as run_ui
+    except ImportError as e:
+        # tkinter ships in stdlib but a stripped Python build can omit it
+        # (e.g. some headless server installs). Surface a clear hint
+        # rather than the bare ModuleNotFoundError.
+        raise click.ClickException(
+            f"the desktop UI needs tkinter, which is missing: {e}. "
+            "On Ubuntu / Debian: apt-get install python3-tk."
+        ) from e
+    run_ui()
+
+
 if __name__ == "__main__":
     main()
