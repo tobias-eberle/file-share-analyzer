@@ -91,6 +91,12 @@ share-analyzer rescan [<path>] --db <file.db>
                   [--retry-attempts 3] [--checkpoint-every 10000]
                   [--follow-symlinks] [-v]
 
+share-analyzer resume --db <file.db> [--run-id <id>]
+                  [--workers 8] [--dir-workers 4] [--hash-cap-mb 100]
+                  [--exclude <glob>]... [--no-default-excludes]
+                  [--retry-attempts 3] [--checkpoint-every 10000]
+                  [--follow-symlinks] [-v]
+
 share-analyzer report <name|all> --db <file.db> --out <dir>
                   [--format html|csv|jsonl|all] [--run-id <id>]
 
@@ -150,6 +156,37 @@ whose `(size, mtime)` are unchanged (within a 2 s tolerance to absorb
 SMB1/FAT/NTFS rounding differences), fingerprints only the delta, and
 records added / modified / deleted rows so reports can show churn.
 Defaults to diffing against the most recent completed run.
+
+**Pause and resume.** A long crawl can be paused at any time and
+resumed later — same run, no re-fingerprinting of files already
+indexed. From the CLI: hit `Ctrl+C` once during `scan` / `rescan` /
+`resume` and the run drains in-flight files cleanly and ends with
+`status='paused'` (exit code 3). A second `Ctrl+C` falls through to
+the default handler if you really want to abort. Pick it back up
+with `share-analyzer resume --db share.sqlite` (defaults to the most
+recent paused run, or pass `--run-id N`). From the UI: a **Stop**
+button next to the running scan, and a **Resume** button that
+enables when a paused run is selected in the runs table.
+
+```
+$ share-analyzer scan /mnt/share --db share.sqlite
+[scan]    347,892 files     842 f/s    3 err  …/share/projects/x.pdf
+^C
+[interrupt] pausing — finishing in-flight files; press Ctrl+C again to abort.
+paused — run #1: 347,892 files indexed so far. Resume with
+  `share-analyzer resume --db share.sqlite --run-id 1`.
+
+$ share-analyzer resume --db share.sqlite
+share-analyzer 0.1.0: resuming run #1 on /mnt/share
+[scan]    789,000 files     1,204 f/s    3 err  …
+done — run #1: 789,000 files, 3 errors
+```
+
+The resume walker re-walks the directory tree (cheap), but every
+already-indexed path is skipped before reaching a fingerprint
+worker — only the delta is hashed. `materialize_folders` only runs
+once the run actually completes, so partial-snapshot reports never
+masquerade as complete.
 
 **Path-derived tags.** Every indexed file gets a `tags` column —
 folder names from its path, lowercased and deduped, with drive

@@ -29,6 +29,7 @@ from typing import Callable, Optional, Sequence
 from share_analyzer.crawl.fingerprint import Fingerprint, Fingerprinter, StreamingFingerprinter
 from share_analyzer.crawl.health import HealthMonitor
 from share_analyzer.crawl.rescan import RescanContext
+from share_analyzer.crawl.resume import ResumeContext
 from share_analyzer.crawl.retry import DEFAULT_BACKOFF
 from share_analyzer.crawl.sink import Sink, SqliteSink
 from share_analyzer.crawl.walker import FileEntry, LocalScandirWalker, WalkError, Walker
@@ -58,6 +59,9 @@ class CrawlOptions:
     excluded_paths: Sequence[str] = ()
     follow_symlinks: bool = False
     previous_run_id: Optional[int] = None
+    # Resume a paused run instead of starting a new one. Mutually
+    # exclusive with previous_run_id (rescan).
+    resume_run_id: Optional[int] = None
     retry_backoff: Sequence[float] = DEFAULT_BACKOFF
     dir_workers: int = 1
     health_error_threshold: int = 50
@@ -88,8 +92,14 @@ def run_crawl(
     fingerprinter: Optional[Fingerprinter] = None,
     sink: Optional[Sink] = None,
     progress: Optional[Callable[[int, int, str], None]] = None,
+    stop_event: Optional[threading.Event] = None,
 ) -> CrawlResult:
     options = options or CrawlOptions()
+    if options.previous_run_id is not None and options.resume_run_id is not None:
+        raise ValueError(
+            "previous_run_id (rescan) and resume_run_id (resume) are "
+            "mutually exclusive — pick one"
+        )
     walker = walker or LocalScandirWalker(
         root,
         exclude_globs=options.exclude_globs,
@@ -117,13 +127,27 @@ def run_crawl(
             "prior_files": len(rescan_ctx),
         })
 
-    run_id = sink.begin_run(
-        str(root),
-        workers=options.workers,
-        hash_cap_bytes=options.hash_cap_bytes,
-        previous_run_id=options.previous_run_id,
-    )
-    log.info("crawl-start", extra={"run_id": run_id, "root": str(root)})
+    resume_ctx: Optional[ResumeContext] = None
+    if options.resume_run_id is not None:
+        resume_ctx = ResumeContext(sink.conn, options.resume_run_id)  # type: ignore[attr-defined]
+        log.info("resume-context", extra={
+            "resume_run_id": options.resume_run_id,
+            "already_indexed": len(resume_ctx),
+        })
+
+    if resume_ctx is not None:
+        run_id = sink.resume_run(options.resume_run_id)  # type: ignore[arg-type]
+        log.info("crawl-resume", extra={
+            "run_id": run_id, "already_indexed": len(resume_ctx),
+        })
+    else:
+        run_id = sink.begin_run(
+            str(root),
+            workers=options.workers,
+            hash_cap_bytes=options.hash_cap_bytes,
+            previous_run_id=options.previous_run_id,
+        )
+        log.info("crawl-start", extra={"run_id": run_id, "root": str(root)})
 
     default_state = "baseline" if rescan_ctx is None else "added"
     in_q: queue.Queue = queue.Queue(maxsize=options.queue_size)
@@ -232,6 +256,14 @@ def run_crawl(
         for item in walker.walk():
             if abort.is_set():
                 break
+            # User-requested pause: just stop emitting. Don't `abort` —
+            # that would make workers drop items already in `in_q`. We
+            # WANT the in-flight batch to land on disk so resume picks
+            # up where we left off. The walker's `finally` pushes
+            # sentinels normally, workers drain, writer flushes.
+            if stop_event is not None and stop_event.is_set():
+                log.info("crawl-stop-requested", extra={"run_id": run_id})
+                break
             if isinstance(item, WalkError):
                 # Record on the main thread so the disconnect check
                 # below sees the just-arrived error before we decide
@@ -247,6 +279,12 @@ def run_crawl(
                     break
                 if not _put(out_q, item, abort):
                     break
+                continue
+
+            # Resume: a path already indexed in this run is silently
+            # skipped — the walker re-walks the tree, but nothing
+            # downstream re-fingerprints or re-writes it.
+            if resume_ctx is not None and item.path in resume_ctx:
                 continue
 
             if rescan_ctx is None:
@@ -269,9 +307,21 @@ def run_crawl(
             t.join()
         writer_thread.join()
 
+    # When resuming, `file_count` only counted the rows we wrote this
+    # session — but the run's true total is everything in `files` for
+    # this run_id. Reconcile once at end-of-run so end_run / CrawlResult
+    # show the actual snapshot size, not the per-session delta.
+    def _total_for_run() -> int:
+        row = sink.conn.execute(  # type: ignore[attr-defined]
+            "SELECT COUNT(*) FROM files WHERE run_id = ? AND state != 'deleted'",
+            (run_id,),
+        ).fetchone()
+        return int(row[0]) if row else file_count
+    total_file_count = _total_for_run() if resume_ctx is not None else file_count
+
     if writer_exc:
         sink.end_run(
-            file_count=file_count, error_count=error_count, status="failed",
+            file_count=total_file_count, error_count=error_count, status="failed",
         )
         sink.close()
         log.error("crawl-failed", extra={"run_id": run_id})
@@ -281,7 +331,7 @@ def run_crawl(
         # Don't materialize folders on a partial snapshot — it would
         # masquerade as a complete one in subsequent reports.
         sink.end_run(
-            file_count=file_count, error_count=error_count,
+            file_count=total_file_count, error_count=error_count,
             status="disconnected",
         )
         sink.wal_checkpoint()
@@ -289,13 +339,39 @@ def run_crawl(
         log.error("crawl-disconnected", extra={"run_id": run_id})
         return CrawlResult(
             run_id=run_id,
-            file_count=file_count,
+            file_count=total_file_count,
             error_count=error_count,
             status="disconnected",
             previous_run_id=options.previous_run_id,
             advisory=("share became unreachable mid-crawl; partial run "
                       "left in the index for forensics — re-run `scan` "
                       "once the mount is restored"),
+        )
+
+    # User-requested pause: leave the run in a resumable state.
+    # Skip materialize_folders for the same reason as 'disconnected'
+    # — partial folder aggregates would lie in any report.
+    if stop_event is not None and stop_event.is_set():
+        sink.end_run(
+            file_count=total_file_count, error_count=error_count,
+            status="paused",
+        )
+        sink.wal_checkpoint()
+        sink.close()
+        log.info("crawl-paused", extra={
+            "run_id": run_id, "files": total_file_count,
+        })
+        return CrawlResult(
+            run_id=run_id,
+            file_count=total_file_count,
+            error_count=error_count,
+            status="paused",
+            previous_run_id=options.previous_run_id,
+            advisory=(
+                f"run paused with {total_file_count:,} files indexed; "
+                "use `share-analyzer resume` (CLI) or the Resume "
+                "button (UI) to continue"
+            ),
         )
 
     deleted_count = 0
@@ -313,15 +389,16 @@ def run_crawl(
         from share_analyzer.index.queries import changed_files_summary
         state_counts = changed_files_summary(sink.conn, run_id)  # type: ignore[attr-defined]
 
-    sink.end_run(file_count=file_count, error_count=error_count, status="completed")
+    sink.end_run(file_count=total_file_count, error_count=error_count,
+                 status="completed")
     sink.wal_checkpoint()
     sink.close()
     log.info("crawl-end", extra={
-        "run_id": run_id, "files": file_count, "errors": error_count,
+        "run_id": run_id, "files": total_file_count, "errors": error_count,
     })
     return CrawlResult(
         run_id=run_id,
-        file_count=file_count,
+        file_count=total_file_count,
         error_count=error_count,
         status="completed",
         previous_run_id=options.previous_run_id,

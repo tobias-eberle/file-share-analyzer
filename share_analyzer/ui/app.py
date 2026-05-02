@@ -151,6 +151,9 @@ class App:
         self.btn_scan = ttk.Button(frm_run, text="Start scan",
                                     command=self._on_start_scan)
         self.btn_scan.pack(side="left")
+        self.btn_stop = ttk.Button(frm_run, text="Stop",
+                                    command=self._on_stop, state="disabled")
+        self.btn_stop.pack(side="left", padx=(6, 0))
 
         self.var_progress = tk.StringVar(value="")
         ttk.Label(frm_run, textvariable=self.var_progress,
@@ -189,6 +192,9 @@ class App:
         self.btn_refresh = ttk.Button(frm_run_actions, text="Refresh",
                                        command=self._refresh_runs)
         self.btn_refresh.pack(side="left")
+        self.btn_resume = ttk.Button(frm_run_actions, text="Resume",
+                                      command=self._on_resume, state="disabled")
+        self.btn_resume.pack(side="left", padx=(8, 0))
         self.btn_rescan = ttk.Button(frm_run_actions, text="Rescan against this run",
                                       command=self._on_rescan, state="disabled")
         self.btn_rescan.pack(side="left", padx=(8, 0))
@@ -401,6 +407,47 @@ class App:
         ):
             self._set_idle()
 
+    def _on_resume(self) -> None:
+        run_id = self._selected_run_id()
+        if run_id is None:
+            return
+        db = (self.var_db.get() or "").strip()
+        if not db:
+            return
+        details = self.controller.run_details(Path(db), run_id)
+        if details.get("status") != "paused":
+            messagebox.showerror(
+                "share-analyzer",
+                f"Run #{run_id} status is '{details.get('status')}'. "
+                "Resume only works on 'paused' runs.",
+            )
+            return
+        prev_root = details.get("root_path")
+        if not prev_root or not Path(prev_root).is_dir():
+            messagebox.showerror(
+                "share-analyzer",
+                f"Run's root '{prev_root}' is no longer accessible — "
+                "remount the share and try again.",
+            )
+            return
+
+        options = self._resolve_options()
+        options.resume_run_id = run_id  # type: ignore[misc]
+        self.var_path.set(prev_root)
+        self._set_running(f"Resuming run #{run_id} on {prev_root}…")
+        if not self.controller.start_resume(
+            Path(prev_root), Path(db), options,
+        ):
+            self._set_idle()
+
+    def _on_stop(self) -> None:
+        if self.controller.stop():
+            self.var_status.set(
+                "Stopping… draining in-flight files; the run will be "
+                "marked 'paused'."
+            )
+            self.btn_stop.configure(state="disabled")
+
     def _on_reports(self) -> None:
         run_id = self._selected_run_id()
         if run_id is None:
@@ -456,10 +503,24 @@ class App:
         messagebox.showinfo(f"Run #{run_id}", "\n".join(lines))
 
     def _on_select_run(self, _event=None) -> None:
-        has_selection = bool(self.tree.selection())
+        sel = self.tree.selection()
+        has_selection = bool(sel)
         state = "normal" if has_selection else "disabled"
         for btn in (self.btn_rescan, self.btn_reports, self.btn_info):
             btn.configure(state=state)
+        # Resume only makes sense for `paused` runs. Read the row's
+        # status column so we don't have to round-trip to the DB just
+        # to update a button's enabled state.
+        resume_state = "disabled"
+        if has_selection:
+            try:
+                values = self.tree.item(sel[0], "values")
+                # RUN_COLUMNS index 2 is "Status"
+                if len(values) > 2 and values[2] == "paused":
+                    resume_state = "normal"
+            except (IndexError, tk.TclError):
+                pass
+        self.btn_resume.configure(state=resume_state)
 
     # ------------------------------------------------------------------
     # Runs table refresh
@@ -512,6 +573,13 @@ class App:
                     msg += f"\n\nAdvisory: {result.advisory}"
                 messagebox.showwarning("share-analyzer", msg)
                 return
+            if result.status == "paused":
+                msg = (f"{kind.title()} paused: run #{result.run_id} "
+                       f"left at {result.file_count:,} files indexed. "
+                       f"Select it in the runs list and click Resume "
+                       f"to continue.")
+                self.var_status.set(msg)
+                return
             sc = result.state_counts or {}
             if sc:
                 msg = (f"Rescan #{result.run_id} done: "
@@ -521,7 +589,8 @@ class App:
                        f"-{sc.get('deleted', 0):,} deleted "
                        f"({result.error_count:,} errors).")
             else:
-                msg = (f"Scan #{result.run_id} done: "
+                verb = "Resumed run" if kind == "resume" else f"Scan"
+                msg = (f"{verb} #{result.run_id} done: "
                        f"{result.file_count:,} files, "
                        f"{result.error_count:,} errors.")
             if result.advisory:
@@ -552,13 +621,16 @@ class App:
         self.var_status.set(status)
         self.btn_scan.configure(state="disabled")
         self.btn_rescan.configure(state="disabled")
+        self.btn_resume.configure(state="disabled")
         self.btn_reports.configure(state="disabled")
         self.btn_info.configure(state="disabled")
         self.btn_refresh.configure(state="disabled")
+        self.btn_stop.configure(state="normal")
         self.progress.start(50)
 
     def _set_idle(self) -> None:
         self.btn_scan.configure(state="normal")
+        self.btn_stop.configure(state="disabled")
         self.btn_refresh.configure(state="normal")
         self.progress.stop()
         self._on_select_run()

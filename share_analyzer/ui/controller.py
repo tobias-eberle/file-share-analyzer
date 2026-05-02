@@ -6,7 +6,8 @@ updates widgets; the controller does the work on background threads.
 
 Event types posted to `events` queue:
   Event("progress", {"files": int, "errors": int, "path": str})
-  Event("done",     {"result": CrawlResult, "kind": "scan"|"rescan"})
+  Event("done",     {"result": CrawlResult,
+                     "kind": "scan"|"rescan"|"resume"})
   Event("reports",  {"out_dir": Path, "artifacts": list[str]})
   Event("error",    {"message": str})
   Event("log",      {"message": str})
@@ -46,6 +47,10 @@ class Controller:
         self.events: queue.Queue[Event] = queue.Queue()
         self._busy = threading.Event()
         self._task: Optional[threading.Thread] = None
+        # Stop signal handed to the orchestrator on scan / rescan /
+        # resume. A new event per task so a stale `set()` from a
+        # previous run can't pause the next one.
+        self._stop_event: Optional[threading.Event] = None
 
     # ------------------------------------------------------------------
     # Status — UI reads these synchronously to enable/disable widgets.
@@ -53,6 +58,19 @@ class Controller:
 
     def is_busy(self) -> bool:
         return self._busy.is_set()
+
+    def stop(self) -> bool:
+        """Ask the running task to pause cleanly.
+
+        Returns False if no task is running. The orchestrator drains
+        in-flight work, marks the run `status='paused'`, and posts a
+        normal `done` event (with the `paused` result status); the
+        view doesn't need a separate code path for it.
+        """
+        if self._stop_event is None or not self._busy.is_set():
+            return False
+        self._stop_event.set()
+        return True
 
     # ------------------------------------------------------------------
     # Read-only DB helpers — synchronous, fast, no thread.
@@ -124,6 +142,17 @@ class Controller:
             return False
         return self._spawn(self._do_scan, root, db_path, options, kind="rescan")
 
+    def start_resume(self, root: Path, db_path: Path,
+                     options: CrawlOptions) -> bool:
+        """Continue a paused run. `options.resume_run_id` must be set
+        and the run must currently be in status='paused'."""
+        if options.resume_run_id is None:
+            self.events.put(Event("error", {
+                "message": "resume requires a resume_run_id",
+            }))
+            return False
+        return self._spawn(self._do_scan, root, db_path, options, kind="resume")
+
     def start_reports(self, db_path: Path, run_id: int,
                       out_dir: Path) -> bool:
         """Generate every report into `out_dir`."""
@@ -138,6 +167,9 @@ class Controller:
                 "message": "another task is already running",
             }))
             return False
+        # Fresh stop-event per task — a previous task that ended via
+        # stop() must not pre-set this one.
+        self._stop_event = threading.Event()
         self._busy.set()
         t = threading.Thread(target=self._run_safely, args=(fn,) + args,
                              kwargs=kwargs, daemon=True)
@@ -164,6 +196,7 @@ class Controller:
             }))
         result: CrawlResult = run_crawl(
             root, db_path, options, progress=progress_cb,
+            stop_event=self._stop_event,
         )
         self.events.put(Event("done", {"result": result, "kind": kind}))
 
