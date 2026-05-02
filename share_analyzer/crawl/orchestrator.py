@@ -55,6 +55,7 @@ class CrawlOptions:
     queue_size: int = 1024
     checkpoint_every: int = 10_000
     exclude_globs: Sequence[str] = ()
+    excluded_paths: Sequence[str] = ()
     follow_symlinks: bool = False
     previous_run_id: Optional[int] = None
     retry_backoff: Sequence[float] = DEFAULT_BACKOFF
@@ -92,6 +93,7 @@ def run_crawl(
     walker = walker or LocalScandirWalker(
         root,
         exclude_globs=options.exclude_globs,
+        excluded_paths=options.excluded_paths,
         follow_symlinks=options.follow_symlinks,
         retry_backoff=options.retry_backoff,
         dir_workers=options.dir_workers,

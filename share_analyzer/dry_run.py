@@ -6,7 +6,7 @@ from __future__ import annotations
 from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Sequence
+from typing import Iterable, Sequence
 
 from share_analyzer.crawl.retry import DEFAULT_BACKOFF
 from share_analyzer.crawl.walker import (
@@ -32,6 +32,7 @@ def dry_run(
     root: str | Path,
     *,
     exclude_globs: Sequence[str] = (),
+    excluded_paths: Iterable[str] = (),
     follow_symlinks: bool = False,
     retry_backoff: Sequence[float] = DEFAULT_BACKOFF,
     dir_workers: int = 1,
@@ -45,6 +46,7 @@ def dry_run(
     walker = walker or LocalScandirWalker(
         root,
         exclude_globs=exclude_globs,
+        excluded_paths=excluded_paths,
         follow_symlinks=follow_symlinks,
         retry_backoff=retry_backoff,
         dir_workers=dir_workers,

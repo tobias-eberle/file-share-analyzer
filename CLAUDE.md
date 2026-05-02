@@ -27,6 +27,8 @@ share_analyzer/
   tags.py                 # extract_tags: folder-path → list[str]
   ui/
     controller.py         # Tk-free: threads, event queue, list_runs/details
+    folder_selection.py   # Tk-free: per-path included/excluded model
+    folder_tree.py        # Tk dialog: lazy-load tree picker
     app.py                # Tk widgets — folder pickers, runs table, progress
     __main__.py           # `python -m share_analyzer.ui`
   crawl/
@@ -284,6 +286,32 @@ display server. By keeping the work in `Controller`, the
 `tests/test_ui_controller.py` suite covers start_scan/start_rescan/
 start_reports/error-paths headlessly. The view is smoke-imported
 only — no test mainloop.
+
+### Subfolder picker
+
+The "Choose subfolders…" button next to the path entry opens a
+modal `FolderTreeDialog` (`ui/folder_tree.py`) that lazy-loads
+subdirectories via `os.scandir` on each disclosure-arrow click. The
+view tracks state through a Tk-free `FolderSelection` model
+(`ui/folder_selection.py`) with three guarantees:
+
+1. Excluding a folder excludes all descendants — the UX never lets
+   you "exclude the parent but include this one child" because the
+   walker can't honour that without descending into a pruned
+   subtree.
+2. `excluded_paths()` returns the **minimal** set the walker needs:
+   if `/foo/bar` is excluded, listing `/foo/bar/baz` is dropped.
+3. State is keyed on `str(Path(p))` so trailing slashes / mixed
+   separators don't produce different keys for the same folder.
+
+Walker integration: `LocalScandirWalker(excluded_paths=…)` and
+`CrawlOptions.excluded_paths`. Path-exact pruning, distinct from
+`exclude_globs` which still matches by name/pattern. The orchestrator
+plumbs both through to the walker. `tests/test_folder_selection.py`
+covers the model, walker pruning (sequential and parallel),
+parent-prefix-not-confused-with-descendant edge cases, normalisation
+of trailing slashes / Path objects, and a full round-trip via
+`run_crawl` confirming the excluded subtree never reaches the index.
 
 `tkinter` is stdlib but a stripped Python build can omit it. The CLI
 subcommand catches the ImportError and gives a clear "apt-get install

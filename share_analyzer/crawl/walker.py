@@ -93,16 +93,26 @@ class LocalScandirWalker:
 
     def __init__(self, root: str | Path, *,
                  exclude_globs: Sequence[str] = (),
+                 excluded_paths: Iterable[str] = (),
                  follow_symlinks: bool = False,
                  retry_backoff: Sequence[float] = DEFAULT_BACKOFF,
                  dir_workers: int = 1) -> None:
         self.root = str(Path(root))
         self.exclude_globs = tuple(exclude_globs)
+        # Path-exact exclusions from the UI tree picker. Distinct from
+        # `exclude_globs`: globs match anywhere by name/pattern; this
+        # set is "skip these specific subtrees of the chosen root."
+        # Normalised once here so per-entry lookups are pure dict-hits.
+        self.excluded_paths: frozenset[str] = frozenset(
+            str(Path(p)) for p in excluded_paths
+        )
         self.follow_symlinks = follow_symlinks
         self.retry_backoff = tuple(retry_backoff)
         self.dir_workers = max(1, dir_workers)
 
     def _excluded(self, name: str, full: str) -> bool:
+        if full in self.excluded_paths:
+            return True
         if not self.exclude_globs:
             return False
         return any(fnmatch(name, g) or fnmatch(full, g) for g in self.exclude_globs)
