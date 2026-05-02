@@ -60,7 +60,14 @@ class App:
         self.var_default_excludes = tk.BooleanVar(value=True)
         self.var_follow_symlinks = tk.BooleanVar(value=False)
         self.var_dry_run = tk.BooleanVar(value=False)
+        self.var_subfolder_summary = tk.StringVar(value="All subfolders included.")
         self.var_status = tk.StringVar(value="Idle. Pick a folder and a DB to begin.")
+        # Excluded subtrees chosen via the FolderTreeDialog. Cleared
+        # whenever the source path changes — selections only make sense
+        # against a specific root.
+        self._excluded_paths: tuple[str, ...] = ()
+        self._excluded_for_path: str = ""
+        self.var_path.trace_add("write", lambda *_: self._on_path_changed())
 
         self._build_layout()
         self._refresh_runs()
@@ -84,12 +91,27 @@ class App:
         ttk.Button(frm_inputs, text="Browse…",
                    command=self._pick_folder).grid(row=0, column=2, padx=6)
 
-        ttk.Label(frm_inputs, text="Index DB:").grid(
+        # Subfolder picker — sits directly under the path entry so the
+        # relationship "this set is FOR that path" is obvious.
+        ttk.Label(frm_inputs, text="Subfolders:").grid(
             row=1, column=0, sticky="e", padx=6, pady=4)
+        sub_row = ttk.Frame(frm_inputs)
+        sub_row.grid(row=1, column=1, sticky="ew", padx=6, pady=4)
+        ttk.Label(sub_row, textvariable=self.var_subfolder_summary,
+                  foreground="#444").pack(side="left")
+        ttk.Button(sub_row, text="Reset",
+                   command=self._reset_subfolders).pack(side="right",
+                                                         padx=(6, 0))
+        ttk.Button(frm_inputs, text="Choose…",
+                   command=self._pick_subfolders).grid(
+            row=1, column=2, padx=6)
+
+        ttk.Label(frm_inputs, text="Index DB:").grid(
+            row=2, column=0, sticky="e", padx=6, pady=4)
         ttk.Entry(frm_inputs, textvariable=self.var_db, width=60).grid(
-            row=1, column=1, sticky="ew", padx=6, pady=4)
+            row=2, column=1, sticky="ew", padx=6, pady=4)
         btn_db = ttk.Frame(frm_inputs)
-        btn_db.grid(row=1, column=2, padx=6)
+        btn_db.grid(row=2, column=2, padx=6)
         ttk.Button(btn_db, text="Open…",
                    command=self._pick_existing_db).pack(side="left")
         ttk.Button(btn_db, text="New…",
@@ -216,16 +238,76 @@ class App:
             self._refresh_runs()
 
     # ------------------------------------------------------------------
+    # Subfolder selection
+    # ------------------------------------------------------------------
+
+    def _pick_subfolders(self) -> None:
+        path = (self.var_path.get() or "").strip()
+        if not path or not Path(path).is_dir():
+            messagebox.showerror(
+                "share-analyzer",
+                "Pick a 'Folder to scan' first — subfolder selection is "
+                "relative to that root.",
+            )
+            return
+        # Late import — keeps the FolderTreeDialog import out of the
+        # cold-start path for users who only ever use the CLI.
+        from share_analyzer.ui.folder_tree import FolderTreeDialog
+        # Carry forward existing selection if the user is re-opening the
+        # dialog for the same root.
+        initial = self._excluded_paths if self._excluded_for_path == path else ()
+        result = FolderTreeDialog(
+            self.root, path, initial_excluded=initial,
+        ).show()
+        if result is None:
+            return  # cancelled
+        self._excluded_paths = result
+        self._excluded_for_path = path
+        self._refresh_subfolder_summary()
+
+    def _reset_subfolders(self) -> None:
+        self._excluded_paths = ()
+        self._excluded_for_path = ""
+        self._refresh_subfolder_summary()
+
+    def _on_path_changed(self) -> None:
+        # If the user typed a different root, the prior excluded set is
+        # against the wrong tree. Clearing is the safe default.
+        current = (self.var_path.get() or "").strip()
+        if current != self._excluded_for_path and self._excluded_paths:
+            self._excluded_paths = ()
+            self._excluded_for_path = ""
+        self._refresh_subfolder_summary()
+
+    def _refresh_subfolder_summary(self) -> None:
+        n = len(self._excluded_paths)
+        if n == 0:
+            self.var_subfolder_summary.set("All subfolders included.")
+        else:
+            self.var_subfolder_summary.set(
+                f"{n} subtree(s) excluded."
+            )
+
+    # ------------------------------------------------------------------
     # Run actions
     # ------------------------------------------------------------------
 
     def _resolve_options(self) -> CrawlOptions:
         excludes = DEFAULT_EXCLUDES if self.var_default_excludes.get() else ()
+        # Only pass the excluded set if it was chosen against the
+        # current path — `_on_path_changed` already clears stale ones,
+        # but be defensive in case the field was edited concurrently.
+        current_path = (self.var_path.get() or "").strip()
+        excluded_paths = (
+            self._excluded_paths
+            if self._excluded_for_path == current_path else ()
+        )
         return CrawlOptions(
             workers=max(1, int(self.var_workers.get() or 1)),
             dir_workers=max(1, int(self.var_dir_workers.get() or 1)),
             hash_cap_bytes=int(self.var_hash_cap.get() or 1) * 1024 * 1024,
             exclude_globs=excludes,
+            excluded_paths=excluded_paths,
             follow_symlinks=bool(self.var_follow_symlinks.get()),
         )
 
@@ -257,10 +339,15 @@ class App:
         # The dry-run path is fast and synchronous — no DB writes, just
         # walk + count. Run it inline rather than spinning a thread.
         from share_analyzer.dry_run import dry_run, format_summary
+        excluded_paths = (
+            self._excluded_paths
+            if self._excluded_for_path == str(path) else ()
+        )
         try:
             summary = dry_run(
                 path,
                 exclude_globs=DEFAULT_EXCLUDES if self.var_default_excludes.get() else (),
+                excluded_paths=excluded_paths,
                 follow_symlinks=self.var_follow_symlinks.get(),
                 dir_workers=max(1, int(self.var_dir_workers.get() or 1)),
             )

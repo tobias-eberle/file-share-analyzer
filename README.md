@@ -35,6 +35,13 @@ so they can be emailed or dropped on a SharePoint without hosting.
 `share-analyzer ui` opens a Tkinter window with:
 
 - A native OS folder picker for the share to scan and the index DB.
+- A "Choose subfolders…" button that opens a tree picker: drill into
+  the chosen root, double-click (or press Space, or use the
+  Include/Exclude buttons) to toggle individual subfolders. Excluded
+  subtrees show a `✗`, partially-excluded parents show `◐`. Subtrees
+  are loaded on demand as you expand them, so a 4 TB share opens
+  instantly. Selections are scoped to the current root and are
+  cleared automatically if the root changes.
 - Workers / dir-workers / hash-cap controls and the same default-exclude
   toggle as the CLI.
 - A live progress line (`12,345 files   3 err   …/share/foo/bar.md`)
