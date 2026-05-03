@@ -1,9 +1,12 @@
-"""Click-based CLI: scan, rescan, report, info."""
+"""Click-based CLI: scan, rescan, resume, report, info."""
 from __future__ import annotations
 
+import signal
 import sys
+import threading
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Sequence
+from typing import Iterator, Sequence
 
 import click
 
@@ -29,6 +32,40 @@ def _resolve_excludes(cfg: dict, cli_excludes: Sequence[str],
     use_defaults = not no_defaults and cfg.get("default_excludes", True)
     defaults = DEFAULT_EXCLUDES if use_defaults else ()
     return tuple(defaults) + tuple(cfg.get("exclude", [])) + tuple(cli_excludes)
+
+
+@contextmanager
+def _sigint_pauses(stop_event: threading.Event) -> Iterator[None]:
+    """Catch the first Ctrl+C and turn it into a graceful pause.
+
+    The orchestrator drains in-flight files and ends the run as
+    'paused', which `resume` can pick back up. A second Ctrl+C
+    falls through to the default handler, killing the process —
+    so the user always has an escape hatch.
+    """
+    armed = {"first": True}
+
+    def handler(signum, frame):
+        if armed["first"]:
+            armed["first"] = False
+            click.echo(
+                "\n[interrupt] pausing — finishing in-flight files; "
+                "press Ctrl+C again to abort.",
+                err=True,
+            )
+            stop_event.set()
+        else:
+            # Restore default and re-raise so the second hit really
+            # kills the process (Python's default SIGINT handler
+            # raises KeyboardInterrupt).
+            signal.signal(signal.SIGINT, signal.default_int_handler)
+            raise KeyboardInterrupt
+
+    previous = signal.signal(signal.SIGINT, handler)
+    try:
+        yield
+    finally:
+        signal.signal(signal.SIGINT, previous)
 
 
 def _resolve_backoff(retry_attempts: int) -> tuple[float, ...]:
@@ -134,7 +171,10 @@ def scan(ctx: click.Context, path: Path, db_path: Path | None,
     )
 
     click.echo(f"share-analyzer {__version__}: scanning {path} → {db_path}")
-    result = run_crawl(path, db_path, options, progress=progress.update)
+    stop_event = threading.Event()
+    with _sigint_pauses(stop_event):
+        result = run_crawl(path, db_path, options, progress=progress.update,
+                            stop_event=stop_event)
     progress.finish()
     if result.status == "disconnected":
         click.echo(
@@ -145,6 +185,14 @@ def scan(ctx: click.Context, path: Path, db_path: Path | None,
         if result.advisory:
             click.echo(f"  advisory: {result.advisory}")
         sys.exit(2)
+    if result.status == "paused":
+        click.echo(
+            f"paused — run #{result.run_id}: "
+            f"{result.file_count:,} files indexed so far. "
+            f"Resume with `share-analyzer resume --db {db_path} "
+            f"--run-id {result.run_id}`."
+        )
+        sys.exit(3)
     click.echo(
         f"done — run #{result.run_id}: "
         f"{result.file_count:,} files, {result.error_count:,} errors"
@@ -229,7 +277,10 @@ def rescan(ctx: click.Context, path: Path | None, db_path: Path, from_run: int |
     click.echo(
         f"share-analyzer {__version__}: rescanning {path} against run #{from_run}"
     )
-    result = run_crawl(path, db_path, options, progress=progress.update)
+    stop_event = threading.Event()
+    with _sigint_pauses(stop_event):
+        result = run_crawl(path, db_path, options, progress=progress.update,
+                            stop_event=stop_event)
     progress.finish()
     if result.status == "disconnected":
         click.echo(
@@ -239,6 +290,13 @@ def rescan(ctx: click.Context, path: Path | None, db_path: Path, from_run: int |
         if result.advisory:
             click.echo(f"  advisory: {result.advisory}")
         sys.exit(2)
+    if result.status == "paused":
+        click.echo(
+            f"paused — run #{result.run_id} left at "
+            f"{result.file_count:,} files. Resume with "
+            f"`share-analyzer resume --db {db_path} --run-id {result.run_id}`."
+        )
+        sys.exit(3)
 
     sc = result.state_counts or {}
     click.echo(
@@ -248,6 +306,108 @@ def rescan(ctx: click.Context, path: Path | None, db_path: Path, from_run: int |
         f"={sc.get('unchanged', 0):,} unchanged "
         f"-{sc.get('deleted', 0):,} deleted "
         f"({result.error_count:,} errors)"
+    )
+    if result.advisory:
+        click.echo(f"  advisory: {result.advisory}")
+
+
+@main.command()
+@click.option("--db", "db_path", type=click.Path(path_type=Path, exists=True),
+              required=True, help="Existing SQLite index containing the paused run.")
+@click.option("--run-id", type=int, default=None,
+              help="Run id to resume (defaults to the most recent paused run).")
+@click.option("--workers", type=int, default=8, show_default=True)
+@click.option("--dir-workers", type=int, default=4, show_default=True)
+@click.option("--hash-cap-mb", type=int, default=100, show_default=True)
+@click.option("--exclude", "exclude_globs", multiple=True)
+@click.option("--no-default-excludes", is_flag=True, default=False)
+@click.option("--retry-attempts", type=int, default=len(DEFAULT_BACKOFF),
+              show_default=True)
+@click.option("--checkpoint-every", type=int, default=10_000, show_default=True)
+@click.option("--follow-symlinks", is_flag=True, default=False)
+@click.option("-v", "--verbose", is_flag=True, default=False)
+@click.pass_context
+def resume(ctx: click.Context, db_path: Path, run_id: int | None,
+           workers: int, dir_workers: int, hash_cap_mb: int,
+           exclude_globs: tuple[str, ...],
+           no_default_excludes: bool, retry_attempts: int,
+           checkpoint_every: int, follow_symlinks: bool, verbose: bool) -> None:
+    """Continue a paused run.
+
+    The walker re-walks from the prior run's root, but every path
+    already in the index is skipped — no re-fingerprint, no re-write.
+    Press Ctrl+C again to pause the resumed run; it'll keep the same
+    run_id and you can resume again.
+    """
+    conn = init_db(db_path)
+    if run_id is None:
+        row = conn.execute(
+            "SELECT id FROM crawl_runs WHERE status = 'paused' "
+            "ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        if row is None:
+            conn.close()
+            raise click.ClickException(
+                "no paused runs in this database — `share-analyzer info` "
+                "shows the latest run and its status"
+            )
+        run_id = row[0]
+    s = run_summary(conn, run_id)
+    conn.close()
+    if not s:
+        raise click.ClickException(f"run {run_id} not found")
+    if s["status"] != "paused":
+        raise click.ClickException(
+            f"run {run_id} status is {s['status']!r}; "
+            "resume only works on 'paused' runs"
+        )
+    root = Path(s["root_path"])
+    if not root.is_dir():
+        raise click.ClickException(
+            f"run {run_id} root '{root}' is not a directory — "
+            "remount the share and try again"
+        )
+
+    configure_logging(db_path, verbose=verbose)
+    progress = ProgressPrinter()
+
+    cfg = ctx.obj["config"].get("scan", {}) if ctx.obj else {}
+    effective_excludes = _resolve_excludes(cfg, exclude_globs, no_default_excludes)
+    options = CrawlOptions(
+        workers=workers,
+        dir_workers=dir_workers,
+        hash_cap_bytes=hash_cap_mb * 1024 * 1024,
+        exclude_globs=effective_excludes,
+        checkpoint_every=checkpoint_every,
+        follow_symlinks=follow_symlinks,
+        resume_run_id=run_id,
+        retry_backoff=_resolve_backoff(retry_attempts),
+    )
+
+    click.echo(
+        f"share-analyzer {__version__}: resuming run #{run_id} on {root}"
+    )
+    stop_event = threading.Event()
+    with _sigint_pauses(stop_event):
+        result = run_crawl(root, db_path, options, progress=progress.update,
+                            stop_event=stop_event)
+    progress.finish()
+    if result.status == "disconnected":
+        click.echo(
+            f"interrupted — run #{result.run_id} marked 'disconnected' "
+            f"({result.error_count:,} errors before the share went away)"
+        )
+        sys.exit(2)
+    if result.status == "paused":
+        click.echo(
+            f"paused again — run #{result.run_id} now at "
+            f"{result.file_count:,} files. Resume with "
+            f"`share-analyzer resume --db {db_path} --run-id {result.run_id}`."
+        )
+        sys.exit(3)
+    click.echo(
+        f"done — run #{result.run_id}: "
+        f"{result.file_count:,} files, {result.error_count:,} errors"
     )
     if result.advisory:
         click.echo(f"  advisory: {result.advisory}")

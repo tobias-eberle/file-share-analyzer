@@ -36,6 +36,7 @@ share_analyzer/
     fingerprint.py        # Fingerprinter + StreamingFingerprinter
     sink.py               # Sink + SqliteSink (batched, WAL)
     rescan.py             # RescanContext: prior-run delta classifier
+    resume.py             # ResumeContext: skip-already-indexed for paused runs
     retry.py              # is_transient + with_retry for SMB I/O
     health.py             # HealthMonitor: disconnect detection + advisory
     orchestrator.py       # threading + queues + abort handling
@@ -128,6 +129,43 @@ Three deliberately small ideas:
 Non-tty streams (CI logs, redirected stdout) skip the rendering
 entirely — `\r` floods are noise in log files. The CLI still prints
 the final summary line; that's enough for non-interactive runs.
+
+### Pause / resume
+
+Two new orthogonal axes on top of the existing scan / rescan modes:
+
+- **`stop_event: threading.Event`** — passed to `run_crawl` as a kwarg.
+  When set mid-walk, the orchestrator stops emitting new items but
+  **does not abort downstream**. Workers still drain `in_q`, the
+  writer flushes its batch, and the run ends with
+  `status='paused'`. This is the critical distinction from the
+  writer-failed (`abort.set()`) and disconnect (`abort.set()`) paths,
+  which both DO drop in-flight items: a pause is supposed to flush
+  what's already queued so resume picks up from the cleanest possible
+  point.
+
+  The CLI installs a SIGINT handler in `scan` / `rescan` / `resume`
+  that flips the stop event on the first Ctrl+C and prints a hint;
+  a second Ctrl+C falls through to Python's default handler, so the
+  user always has an escape hatch.
+
+- **`resume_run_id` in `CrawlOptions`** — different intent from
+  `previous_run_id` (rescan). On resume, `sink.resume_run(rid)`
+  reuses the existing run row (status `paused` → `running`) and a
+  `ResumeContext` loads the set of paths already indexed in this run.
+  The orchestrator silently skips any walker entry whose path is in
+  that set — no fingerprint, no insert. New entries flow through
+  the normal pipeline. On completion, `materialize_folders` runs
+  against the now-complete set; on a second pause, it doesn't.
+
+  `previous_run_id` and `resume_run_id` are mutually exclusive —
+  `run_crawl` raises if both are set.
+
+`crawl_runs.file_count` is reconciled at end-of-run when resuming —
+the running tally `file_count` only counts rows written *this
+session*, but the row's authoritative count is `SELECT COUNT(*)
+FROM files WHERE run_id = ?`. Done lazily in `_total_for_run()`
+so the non-resume hot path pays nothing.
 
 ### Disconnect detection (`HealthMonitor`)
 

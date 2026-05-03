@@ -17,6 +17,7 @@ from share_analyzer.tags import extract_tags
 class Sink(Protocol):
     def begin_run(self, root_path: str, *, workers: int, hash_cap_bytes: int,
                   previous_run_id: Optional[int] = None) -> int: ...
+    def resume_run(self, run_id: int) -> int: ...
     def write_files(self, rows: Iterable[tuple[FileEntry, Fingerprint, str]]) -> int: ...
     def write_errors(self, errors: Iterable[WalkError]) -> int: ...
     def checkpoint(self, last_path: Optional[str], files_processed: int) -> None: ...
@@ -65,6 +66,34 @@ class SqliteSink:
             (self._run_id, datetime.now(timezone.utc).isoformat()),
         )
         return self._run_id
+
+    def resume_run(self, run_id: int) -> int:
+        """Re-bind to an existing paused run.
+
+        Flips the row's status from 'paused' back to 'running' and
+        clears `completed_at` (it was set by the previous pause). The
+        orchestrator builds a `ResumeContext` separately to skip
+        already-indexed paths; this method just owns the DB-state
+        transition. Refuses any status other than 'paused' so a typo
+        can't corrupt a completed/failed/disconnected run.
+        """
+        row = self.conn.execute(
+            "SELECT status FROM crawl_runs WHERE id = ?", (run_id,),
+        ).fetchone()
+        if row is None:
+            raise ValueError(f"run {run_id} not found")
+        if row["status"] != "paused":
+            raise ValueError(
+                f"run {run_id} status is {row['status']!r}; "
+                "resume only works on 'paused' runs"
+            )
+        self.conn.execute(
+            "UPDATE crawl_runs SET status = 'running', completed_at = NULL "
+            "WHERE id = ?",
+            (run_id,),
+        )
+        self._run_id = run_id
+        return run_id
 
     def write_files(self, rows: Iterable[tuple[FileEntry, Fingerprint, str]]) -> int:
         run_id = self.run_id
