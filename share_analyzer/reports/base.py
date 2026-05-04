@@ -112,7 +112,10 @@ def run_all(conn: sqlite3.Connection, run_id: int,
 
 
 # Importing the report modules registers them via the @register decorator.
+# Dashboard is imported FIRST so it sits at the top of the registry —
+# `run_all` iterates in registration order and the dashboard is the
+# canonical artifact users want to see open first.
 from share_analyzer.reports import (  # noqa: E402  — side-effecting imports
-    topology, size_hotspots, staleness, duplication,
+    dashboard, topology, size_hotspots, staleness, duplication,
     type_distribution, rag_candidates,
 )

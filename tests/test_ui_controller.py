@@ -209,12 +209,11 @@ def test_start_reports_writes_artifacts_and_posts_event(tmp_path: Path):
 
     assert ev.payload["out_dir"] == str(out)
     artifacts = ev.payload["artifacts"]
-    # Six reports, each producing 1+ files; we just sanity-check that
-    # something landed.
+    # The unified dashboard + per-report CSVs + the RAG JSONL.
     assert len(artifacts) >= 6
     assert any(a.endswith(".html") for a in artifacts)
     assert any(a.endswith(".jsonl") for a in artifacts)
-    assert (out / "topology.html").exists()
+    assert (out / "dashboard.html").exists()
 
 
 def test_controller_surfaces_unhandled_exceptions_as_error_event(tmp_path: Path):

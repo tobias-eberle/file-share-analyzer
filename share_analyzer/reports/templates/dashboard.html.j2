@@ -1,0 +1,486 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{{ title }}</title>
+  <style>
+    :root {
+      --bg:          #fafafa;
+      --card:        #ffffff;
+      --border:      #e5e7eb;
+      --text:        #0f172a;
+      --text-muted:  #64748b;
+      --text-soft:   #94a3b8;
+      --accent:      #2563eb;
+      --accent-soft: #dbeafe;
+      --warn:        #f59e0b;
+      --danger:      #ef4444;
+      --good:        #10b981;
+      --shadow: 0 1px 2px rgba(15, 23, 42, 0.04), 0 1px 3px rgba(15, 23, 42, 0.04);
+    }
+    * { box-sizing: border-box; }
+    html, body { margin: 0; padding: 0; }
+    body {
+      background: var(--bg);
+      color: var(--text);
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
+                   "Helvetica Neue", Arial, sans-serif;
+      line-height: 1.5;
+      -webkit-font-smoothing: antialiased;
+      -moz-osx-font-smoothing: grayscale;
+    }
+    .layout {
+      max-width: 1280px;
+      margin: 0 auto;
+      padding: 40px 32px 96px;
+    }
+
+    /* ---- Hero ----------------------------------------------------- */
+    .hero {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 24px;
+      align-items: baseline;
+      justify-content: space-between;
+      margin-bottom: 24px;
+    }
+    .hero h1 {
+      font-size: 1.5rem;
+      font-weight: 600;
+      margin: 0;
+      letter-spacing: -0.01em;
+    }
+    .hero .meta {
+      color: var(--text-muted);
+      font-size: 0.875rem;
+    }
+    .hero code {
+      font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+      background: var(--accent-soft);
+      color: var(--accent);
+      padding: 2px 6px;
+      border-radius: 4px;
+      font-size: 0.85em;
+    }
+    .hero .pill {
+      display: inline-block;
+      padding: 2px 10px;
+      border-radius: 999px;
+      background: var(--good);
+      color: white;
+      font-size: 0.75rem;
+      font-weight: 500;
+      letter-spacing: 0.02em;
+      vertical-align: 1px;
+      margin-left: 4px;
+    }
+    .hero .pill.warn { background: var(--warn); }
+    .hero .pill.danger { background: var(--danger); }
+    .hero .pill.muted { background: var(--text-soft); }
+
+    /* ---- KPI strip ------------------------------------------------ */
+    .kpis {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+      gap: 12px;
+      margin-bottom: 40px;
+    }
+    .kpi {
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 16px 18px;
+      box-shadow: var(--shadow);
+    }
+    .kpi .label {
+      color: var(--text-muted);
+      font-size: 0.75rem;
+      font-weight: 500;
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+    }
+    .kpi .value {
+      font-size: 1.875rem;
+      font-weight: 600;
+      font-variant-numeric: tabular-nums;
+      margin-top: 4px;
+      letter-spacing: -0.01em;
+    }
+    .kpi .sub {
+      color: var(--text-muted);
+      font-size: 0.8125rem;
+      margin-top: 2px;
+    }
+    .kpi.warn .value { color: var(--warn); }
+    .kpi.danger .value { color: var(--danger); }
+
+    /* ---- Sections ------------------------------------------------- */
+    section { margin-bottom: 36px; }
+    section > h2 {
+      font-size: 1.0625rem;
+      font-weight: 600;
+      margin: 0 0 4px;
+      padding-left: 12px;
+      border-left: 3px solid var(--accent);
+      letter-spacing: -0.005em;
+    }
+    section > .blurb {
+      color: var(--text-muted);
+      font-size: 0.875rem;
+      margin: 0 0 14px;
+      padding-left: 15px;
+    }
+    .grid-2 {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 16px;
+    }
+    @media (max-width: 720px) {
+      .grid-2 { grid-template-columns: 1fr; }
+      .layout { padding: 24px 16px 64px; }
+      .hero { flex-direction: column; gap: 4px; align-items: flex-start; }
+    }
+    .card {
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 16px 18px;
+      box-shadow: var(--shadow);
+    }
+    .card .chart-title {
+      font-size: 0.8125rem;
+      color: var(--text-muted);
+      font-weight: 500;
+      margin: 0 0 8px;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+    }
+    .card .chart-empty {
+      color: var(--text-soft);
+      font-size: 0.875rem;
+      padding: 32px 0;
+      text-align: center;
+    }
+
+    /* ---- Tables under <details> ----------------------------------- */
+    details {
+      margin-top: 14px;
+      border-top: 1px solid var(--border);
+      padding-top: 10px;
+    }
+    details summary {
+      cursor: pointer;
+      font-size: 0.8125rem;
+      color: var(--text-muted);
+      list-style: none;
+      user-select: none;
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+    }
+    details summary::-webkit-details-marker { display: none; }
+    details summary::before {
+      content: "▸";
+      display: inline-block;
+      transition: transform 0.15s ease;
+      font-size: 0.7em;
+      color: var(--text-soft);
+    }
+    details[open] summary::before { transform: rotate(90deg); }
+    details summary:hover { color: var(--text); }
+    details .table-wrap { margin-top: 14px; max-height: 360px; overflow-y: auto; }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 0.875rem;
+    }
+    th, td {
+      padding: 6px 10px;
+      text-align: left;
+      border-bottom: 1px solid var(--border);
+      vertical-align: top;
+    }
+    th {
+      font-weight: 500;
+      color: var(--text-muted);
+      font-size: 0.8125rem;
+      position: sticky;
+      top: 0;
+      background: var(--card);
+    }
+    tr:last-child td { border-bottom: none; }
+    td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
+    td code, p code, span code {
+      font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+      font-size: 0.85em;
+      color: var(--text-muted);
+      word-break: break-all;
+    }
+    .tag {
+      display: inline-block;
+      padding: 1px 8px;
+      border-radius: 12px;
+      font-size: 0.7rem;
+      font-weight: 500;
+      letter-spacing: 0.02em;
+    }
+    .tag-text-extractable { background: #dbeafe; color: #1e40af; }
+    .tag-ocr-needed { background: #fed7aa; color: #9a3412; }
+    .tag-media { background: #fce7f3; color: #9d174d; }
+    .tag-archive { background: #f1f5f9; color: #475569; }
+    .tag-executable { background: #f3e8ff; color: #6b21a8; }
+    .tag-other { background: #f1f5f9; color: #64748b; }
+
+    /* ---- Footer --------------------------------------------------- */
+    .foot {
+      margin-top: 48px;
+      padding-top: 16px;
+      border-top: 1px solid var(--border);
+      color: var(--text-soft);
+      font-size: 0.8125rem;
+      display: flex;
+      flex-wrap: wrap;
+      gap: 16px;
+      justify-content: space-between;
+    }
+
+    /* ---- Plotly tweaks -------------------------------------------- */
+    .js-plotly-plot { width: 100% !important; }
+    .js-plotly-plot .modebar { opacity: 0.4; }
+    .js-plotly-plot .modebar:hover { opacity: 1; }
+  </style>
+</head>
+<body>
+  <div class="layout">
+    <header class="hero">
+      <div>
+        <h1>Share Analyzer
+          {% if run.status == 'completed' %}
+            <span class="pill">complete</span>
+          {% elif run.status == 'paused' %}
+            <span class="pill warn">paused</span>
+          {% elif run.status == 'disconnected' %}
+            <span class="pill danger">disconnected</span>
+          {% else %}
+            <span class="pill muted">{{ run.status }}</span>
+          {% endif %}
+        </h1>
+        <div class="meta">
+          Run #{{ run.id }} &middot; <code>{{ run.root_path }}</code>
+          {% if run.completed_at %}
+            &middot; finished {{ run.completed_at[:19].replace('T', ' ') }} UTC
+          {% endif %}
+        </div>
+      </div>
+    </header>
+
+    <div class="kpis">
+      <div class="kpi">
+        <div class="label">Files</div>
+        <div class="value">{{ '{:,}'.format(kpis.files) }}</div>
+        <div class="sub">in {{ '{:,}'.format(kpis.folders) }} folders</div>
+      </div>
+      <div class="kpi">
+        <div class="label">Total size</div>
+        <div class="value">{{ kpis.size | human_size }}</div>
+        <div class="sub">{{ '{:,}'.format(kpis.size) }} bytes</div>
+      </div>
+      <div class="kpi {% if kpis.stale_pct >= 50 %}warn{% endif %}">
+        <div class="label">Stale (5y+)</div>
+        <div class="value">{{ '{:.0f}%'.format(kpis.stale_pct) }}</div>
+        <div class="sub">{{ '{:,}'.format(kpis.stale_5y_count) }} files older than 5 years</div>
+      </div>
+      <div class="kpi {% if kpis.wasted > 0 %}warn{% endif %}">
+        <div class="label">Duplication</div>
+        <div class="value">{{ kpis.wasted | human_size }}</div>
+        <div class="sub">wasted across {{ '{:,}'.format(kpis.dup_clusters) }} clusters</div>
+      </div>
+      <div class="kpi">
+        <div class="label">RAG-ready</div>
+        <div class="value">{{ '{:,}'.format(kpis.rag_candidates) }}</div>
+        <div class="sub">files matching default filter</div>
+      </div>
+      {% if kpis.errors > 0 %}
+      <div class="kpi {% if kpis.errors > 100 %}danger{% endif %}">
+        <div class="label">Errors</div>
+        <div class="value">{{ '{:,}'.format(kpis.errors) }}</div>
+        <div class="sub">paths skipped during scan</div>
+      </div>
+      {% endif %}
+    </div>
+
+    <section>
+      <h2>Topology</h2>
+      <p class="blurb">Where the bytes live. Each block is a folder, sized by total
+        bytes, coloured by its dominant MIME category.</p>
+      <div class="card">
+        {% if topology_chart %}
+          {{ topology_chart | safe }}
+        {% else %}
+          <div class="chart-empty">No folder data yet.</div>
+        {% endif %}
+        <details>
+          <summary>Folder table ({{ topology_rows | length }} rows)</summary>
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>Path</th>
+                  <th class="num">Depth</th>
+                  <th class="num">Files</th>
+                  <th class="num">Size</th>
+                  <th>Dominant MIME</th>
+                </tr>
+              </thead>
+              <tbody>
+              {% for r in topology_rows %}
+                <tr>
+                  <td><code>{{ r.path }}</code></td>
+                  <td class="num">{{ r.depth }}</td>
+                  <td class="num">{{ '{:,}'.format(r.file_count) }}</td>
+                  <td class="num">{{ r.total_size | human_size }}</td>
+                  <td>{% if r.dominant_mime_category %}<span class="tag tag-{{ r.dominant_mime_category }}">{{ r.dominant_mime_category }}</span>{% endif %}</td>
+                </tr>
+              {% endfor %}
+              </tbody>
+            </table>
+          </div>
+        </details>
+      </div>
+    </section>
+
+    <section>
+      <h2>Size hotspots</h2>
+      <p class="blurb">Largest folders at the top two levels of the tree —
+        the first places to look if you want to reclaim space.</p>
+      <div class="grid-2">
+        <div class="card">
+          <div class="chart-title">Top folders · depth 1</div>
+          {% if h1_chart %}{{ h1_chart | safe }}{% else %}<div class="chart-empty">No depth-1 folders.</div>{% endif %}
+        </div>
+        <div class="card">
+          <div class="chart-title">Top folders · depth 2</div>
+          {% if h2_chart %}{{ h2_chart | safe }}{% else %}<div class="chart-empty">No depth-2 folders.</div>{% endif %}
+        </div>
+      </div>
+    </section>
+
+    <section>
+      <h2>Staleness</h2>
+      <p class="blurb">Bytes by age of the most recently modified file in each bucket.
+        A heavy 5y+ bar usually means archival material that's safe to retire.</p>
+      <div class="card">
+        <div class="chart-title">Bytes by mtime bucket</div>
+        {% if staleness_chart %}{{ staleness_chart | safe }}{% else %}<div class="chart-empty">No mtimes recorded.</div>{% endif %}
+        <details>
+          <summary>Bucket details</summary>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>Bucket</th><th class="num">Files</th><th class="num">Size</th></tr></thead>
+              <tbody>
+              {% for b in staleness_rows %}
+                <tr>
+                  <td>{{ b.bucket }}</td>
+                  <td class="num">{{ '{:,}'.format(b.file_count) }}</td>
+                  <td class="num">{{ b.total_size | human_size }}</td>
+                </tr>
+              {% endfor %}
+              </tbody>
+            </table>
+          </div>
+        </details>
+      </div>
+    </section>
+
+    <section>
+      <h2>Duplication</h2>
+      <p class="blurb">Identical files (same SHA-256). The bar shows the bytes you'd
+        free by keeping one canonical copy of each cluster.</p>
+      <div class="card">
+        <div class="chart-title">Top 10 duplicate clusters by wasted bytes</div>
+        {% if dup_chart %}{{ dup_chart | safe }}{% else %}<div class="chart-empty">No duplicate clusters detected.</div>{% endif %}
+        {% if dup_rows %}
+        <details>
+          <summary>Cluster sample paths</summary>
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>SHA-256</th>
+                  <th class="num">Copies</th>
+                  <th class="num">File size</th>
+                  <th class="num">Wasted</th>
+                  <th>Sample paths</th>
+                </tr>
+              </thead>
+              <tbody>
+              {% for r in dup_rows %}
+                <tr>
+                  <td><code>{{ r.sha256[:12] }}…</code></td>
+                  <td class="num">{{ r.file_count }}</td>
+                  <td class="num">{{ r.file_size | human_size }}</td>
+                  <td class="num">{{ r.wasted_bytes | human_size }}</td>
+                  <td>
+                    {% for p in r.sample_paths[:3] %}<div><code>{{ p }}</code></div>{% endfor %}
+                  </td>
+                </tr>
+              {% endfor %}
+              </tbody>
+            </table>
+          </div>
+        </details>
+        {% endif %}
+      </div>
+    </section>
+
+    <section>
+      <h2>Types</h2>
+      <p class="blurb">Two views on what kind of data is here. The donut tells you
+        what's <em>worth ingesting</em> for RAG; the extension chart tells you what's
+        <em>actually there</em>.</p>
+      <div class="grid-2">
+        <div class="card">
+          <div class="chart-title">Bytes by MIME category</div>
+          {% if cat_chart %}{{ cat_chart | safe }}{% else %}<div class="chart-empty">No MIME data.</div>{% endif %}
+        </div>
+        <div class="card">
+          <div class="chart-title">Top extensions by file count</div>
+          {% if ext_chart %}{{ ext_chart | safe }}{% else %}<div class="chart-empty">No extension data.</div>{% endif %}
+        </div>
+      </div>
+    </section>
+
+    <section>
+      <h2>RAG hand-off</h2>
+      <p class="blurb">Files matching the default ingestion filter — text-extractable,
+        1 KB – 50 MB, modified within the last 5 years, one canonical copy per
+        duplicate cluster.</p>
+      <div class="card">
+        <div class="kpis" style="margin: 0;">
+          <div class="kpi" style="box-shadow: none; border: none; background: transparent; padding: 0;">
+            <div class="label">Candidates</div>
+            <div class="value">{{ '{:,}'.format(kpis.rag_candidates) }}</div>
+            <div class="sub">files</div>
+          </div>
+          <div class="kpi" style="box-shadow: none; border: none; background: transparent; padding: 0;">
+            <div class="label">Combined size</div>
+            <div class="value">{{ kpis.rag_size | human_size }}</div>
+            <div class="sub">to ingest</div>
+          </div>
+          <div class="kpi" style="box-shadow: none; border: none; background: transparent; padding: 0;">
+            <div class="label">Hand-off</div>
+            <div class="value" style="font-size: 1rem;"><code>rag_candidates.jsonl</code></div>
+            <div class="sub">in this report directory</div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <footer class="foot">
+      <div>Share Analyzer dashboard · run #{{ run.id }}</div>
+      <div>{{ '{:,}'.format(kpis.files) }} files · {{ kpis.size | human_size }}</div>
+    </footer>
+  </div>
+</body>
+</html>
