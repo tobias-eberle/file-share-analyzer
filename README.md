@@ -27,8 +27,13 @@ poetry run share-analyzer info --db share.sqlite
 poetry run share-analyzer ui
 ```
 
-The HTML reports are self-contained single files — Plotly is inlined, no CDN —
-so they can be emailed or dropped on a SharePoint without hosting.
+The output is a single **`dashboard.html`** — a self-contained file
+(Plotly inlined, no CDN) that opens with a KPI strip on top and a
+story-flow of charts below: where the bytes live (treemap), the
+biggest folders, age buckets, duplicate clusters, MIME categories,
+and the RAG hand-off summary. Email it, drop it on SharePoint, or
+just double-click to open. CSV exports of the same data sit alongside
+for downstream tooling.
 
 ## Desktop UI
 

@@ -1,55 +1,17 @@
-"""Folder tree to N levels with treemap visualization."""
+"""Folder tree CSV — visualised in the dashboard, exported here for
+downstream tooling that wants the raw rows."""
 from __future__ import annotations
 
 from pathlib import Path
 
-import plotly.graph_objects as go
-
-from share_analyzer.index.queries import run_summary, topology
-from share_analyzer.reports.base import (
-    ReportArtifact, register, render_plotly, write_csv, write_html,
-)
+from share_analyzer.index.queries import topology
+from share_analyzer.reports.base import ReportArtifact, register, write_csv
 
 
-@register("topology", "Folder tree (treemap + table)", ("html", "csv"))
+@register("topology", "Folder tree CSV (visualised in dashboard.html)", ("csv",))
 def report_topology(*, conn, run_id, out_dir: Path, formats):
-    rows = topology(conn, run_id, max_depth=4)
     artifact = ReportArtifact(name="topology", paths=[])
-
     if "csv" in formats:
-        artifact.paths.append(
-            write_csv(out_dir / "topology.csv", rows)
-        )
-
-    if "html" in formats:
-        chart_html = ""
-        if rows:
-            labels = [r["path"] for r in rows]
-            parents = [r["parent_path"] or "" for r in rows]
-            values = [r["total_size"] or 0 for r in rows]
-            colors = [r["dominant_mime_category"] or "other" for r in rows]
-            fig = go.Figure(go.Treemap(
-                labels=labels,
-                parents=parents,
-                values=values,
-                customdata=colors,
-                hovertemplate="<b>%{label}</b><br>%{value:,} bytes<br>%{customdata}<extra></extra>",
-            ))
-            fig.update_layout(
-                title="Folder topology (size-weighted)",
-                margin=dict(t=40, l=10, r=10, b=10),
-            )
-            chart_html = render_plotly(fig)
-
-        artifact.paths.append(write_html(
-            out_dir / "topology.html",
-            "topology.html.j2",
-            {
-                "title": "Topology",
-                "run": run_summary(conn, run_id),
-                "rows": rows,
-                "max_depth": 4,
-                "chart": chart_html,
-            },
-        ))
+        rows = topology(conn, run_id, max_depth=4)
+        artifact.paths.append(write_csv(out_dir / "topology.csv", rows))
     return artifact

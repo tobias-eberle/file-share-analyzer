@@ -45,9 +45,10 @@ share_analyzer/
     mime.py               # MIME categories + libmagic detector
     queries.py            # aggregation queries (read-only)
   reports/
-    base.py               # registry, runners, helpers
-    <report>.py           # one module per report
-    templates/*.html.j2   # jinja2 templates (Plotly inlined)
+    base.py                       # registry, runners, helpers
+    dashboard.py                  # unified dashboard.html (the user-facing artifact)
+    <report>.py                   # one module per report (CSVs only)
+    templates/dashboard.html.j2   # the only HTML template; Plotly inlined once
 tests/
   conftest.py             # fixture_share + crawled_db fixtures
   test_*.py               # see "Testing" below
@@ -70,9 +71,16 @@ break them without a deliberate decision.
 4. **Reports read from `folders` and `files` only.** If a report needs
    data not yet aggregated, add it to `materialize_folders` or to a new
    index helper — don't re-aggregate inside the report.
-5. **HTML reports are self-contained.** Plotly is inlined via
-   `include_plotlyjs="inline"`. No CDN `<script src=>`. The
-   `test_html_reports_are_self_contained` test enforces this.
+5. **One unified `dashboard.html`.** The user-facing report is a
+   single self-contained HTML — KPI strip, story-flow sections, no
+   CDN. Plotly's JS bundle is inlined **exactly once** (the first
+   chart uses `include_plotlyjs="inline"`, every subsequent chart
+   uses `include_plotlyjs=False` and shares the global). The
+   per-report modules still exist but only emit CSVs / JSONL —
+   their old HTML templates are gone. The
+   `test_dashboard_inlines_plotly_only_once` test pins the
+   "exactly once" invariant; `test_dashboard_is_the_only_html`
+   pins "no other `*.html`".
 
 ## Concurrency model (orchestrator)
 
@@ -354,6 +362,40 @@ of trailing slashes / Path objects, and a full round-trip via
 `tkinter` is stdlib but a stripped Python build can omit it. The CLI
 subcommand catches the ImportError and gives a clear "apt-get install
 python3-tk" hint instead of a bare traceback.
+
+## Dashboard report
+
+`reports/dashboard.py` is the only HTML producer. Layout, top to
+bottom:
+
+1. **Hero** — title + status pill + run id + root path + finished-at.
+2. **KPI strip** — Files / Total size / Stale (5y+) / Duplication /
+   RAG-ready (+ Errors when non-zero). Each tile is one number with
+   a label and a one-line "sub" caption. The strip is a CSS Grid
+   with `auto-fit, minmax(180px, 1fr)` so it reflows on narrow
+   windows.
+3. **Sections, in story order** — Topology (treemap, full width)
+   → Size hotspots (depth-1 + depth-2 horizontal bars) → Staleness
+   (cool→warm bucket bar) → Duplication (top-10 wasted-bytes bar) →
+   Types (donut + extension bar) → RAG hand-off (count + size +
+   filename pointer to the JSONL).
+
+Each section has a one-sentence blurb explaining what the chart
+*means*, not what it *is*. Tables are stuffed under a `<details>`
+so the page isn't a wall of HTML; click to expand.
+
+The Plotly theme is centralised in `_theme(fig, height=...)`:
+system-font stack, transparent backgrounds (cards show through),
+small margins, no legend by default, soft grid colour.
+`_MIME_COLORS` and `_STALE_COLORS` keep the palette consistent
+across charts and the inline pill tags in the table. The hex values
+in `dashboard.html.j2` (CSS) and `dashboard.py` (Plotly) must stay
+in sync — when adding a new MIME category, update both.
+
+KPIs are computed from the same `index/queries.py` helpers the
+old per-report modules used. The total-wasted figure uses a
+dedicated `_total_wasted_and_clusters` SQL query so the KPI never
+silently undercounts when there are >100 clusters.
 
 ## Testing
 
